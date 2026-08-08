@@ -1,8 +1,9 @@
 """
 Construit le JSON du devis final: prend les volumes calculés dans
-bilan['volumes_beton']['postes'] (100% Python, déterministe) et les
-transforme en lignes de devis chiffrées avec les prix unitaires de la base
-de connaissances. Aucun calcul de quantité n'est délégué au LLM -- Groq
+bilan['volumes_beton']['postes'] (100% Python, déterministe -- couvre
+infrastructure ET superstructure, postes 3.1 à 3.22) et les transforme en
+lignes de devis chiffrées avec les prix unitaires de la base de
+connaissances. Aucun calcul de quantité n'est délégué au LLM -- Groq
 n'intervient qu'en aval pour une relecture/synthèse (voir groq_client.py).
 """
 
@@ -18,7 +19,16 @@ def _ligne_from_poste(code: str, poste: dict, kb_postes: dict) -> dict:
     unite = kb.get("unite", poste.get("unite", "m3"))
     pu = kb.get("prix_unitaire_fcfa")
 
-    if poste.get("donnee_indisponible") or poste.get("volume_m3") is None:
+    # La quantité vit sous 'volume_m3' pour les postes en m3 (la grande
+    # majorité), mais sous 'quantite_m2' pour les postes en m2 (3.21/3.22,
+    # plancher corps creux -- voir build_volumes_beton). Sans ce repli, ces
+    # deux postes s'affichaient toujours "indisponible" même quand la
+    # surface était bien connue.
+    qte = poste.get("volume_m3")
+    if qte is None:
+        qte = poste.get("quantite_m2")
+
+    if poste.get("donnee_indisponible") or qte is None:
         return {
             "code": code, "designation": designation, "unite": unite,
             "quantite": None, "prix_unitaire_fcfa": pu, "montant_fcfa": None,
@@ -26,7 +36,6 @@ def _ligne_from_poste(code: str, poste: dict, kb_postes: dict) -> dict:
             "note": poste.get("raison", "Donnée indisponible."),
         }
 
-    qte = poste["volume_m3"]
     montant = round(qte * pu) if pu is not None else None
     source = poste.get("source_override") or "regle_locale"
     if poste.get("valeur_par_defaut_utilisee") and "source_override" not in poste:
@@ -82,10 +91,13 @@ def build_devis(bilan: dict, knowledge_base: dict, project_name: str, location: 
                 continue
             lignes_iii.append(_ligne_from_poste(code, postes[poste_key], kb_postes))
     sections_out.append({
-        "numero": "III", "titre": SECTION_III_BETON["titre"] + " (Infrastructures)",
+        "numero": "III", "titre": SECTION_III_BETON["titre"],
         "lignes": lignes_iii,
-        "note": "Superstructure (poteaux/poutres/dalles en élévation, postes 3.11 à 3.22) hors "
-                "périmètre -- nécessite les plans de superstructure, non traités par ce pipeline.",
+        "note": "Infrastructures (3.1-3.10) et superstructures (3.11-3.22) toutes deux calculées "
+                "depuis les plans/note de calcul fournis. Prix unitaires 3.11 à 3.22 pas encore "
+                "renseignés dans la base de prix -- quantités affichées, montant à compléter. "
+                "Le poste 3.18 (escaliers) reste volontairement à compléter manuellement, pour "
+                "éviter un double comptage avec 3.9/3.10.",
     })
 
     total_general = sum(l["montant_fcfa"] for s in sections_out for l in s["lignes"] if l["montant_fcfa"])
@@ -98,6 +110,8 @@ def build_devis(bilan: dict, knowledge_base: dict, project_name: str, location: 
         "sections": sections_out,
         "sections_hors_perimetre": [s["titre"] for s in SECTIONS_HORS_PERIMETRE]
         + ["I. " + SECTION_I_GENERALITES["titre"]],
+        # Nom de clé conservé pour compatibilité (front-end/PDF y font référence) --
+        # couvre en réalité toutes les sections chiffrées (II + III, infra + superstructure).
         "total_infrastructure_fcfa": total_general,
         "postes_a_completer_manuellement": a_confirmer,
         "avertissements": [],

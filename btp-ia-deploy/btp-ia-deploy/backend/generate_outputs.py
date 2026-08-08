@@ -465,7 +465,7 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
     ws["A1"] = f"DEVIS QUANTITATIF ET ESTIMATIF — {project_name}"
     ws["A1"].font = Font(size=15, bold=True)
     ws.merge_cells("A2:G2")
-    ws["A2"] = f"{location} — {date.today().isoformat()} — Infrastructure uniquement (voir notes)"
+    ws["A2"] = f"{location} — {date.today().isoformat()} — voir notes pour les postes hors périmètre"
     ws["A2"].font = Font(size=10, italic=True, color="666666")
 
     row = 4
@@ -487,9 +487,13 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
          "Seuls les postes 2.3/2.4 (fouilles) sont calculés depuis les plans structure. "
          "Les postes 2.1/2.2/2.5 à 2.8 dépendent de données hors périmètre -- à compléter manuellement.",
          ["2.3", "2.4"]),
-        ("III", "BETON - BETON ARME (Infrastructures)",
-         "Superstructure (postes 3.11 à 3.22) hors périmètre -- nécessite les plans de superstructure.",
-         ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10"]),
+        ("III", "BETON - BETON ARME",
+         "Infrastructures (3.1-3.10) et superstructures (3.11-3.22) calculées depuis les plans/note "
+         "de calcul fournis. Prix unitaires 3.11 à 3.22 pas encore renseignés dans la base de prix "
+         "(knowledge_base.json) -- quantités affichées, montant à compléter. Le poste 3.18 (escaliers) "
+         "reste volontairement à compléter manuellement pour éviter un double comptage avec 3.9/3.10.",
+         ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10",
+          "3.11", "3.12", "3.13", "3.14", "3.15", "3.16", "3.17", "3.18", "3.19", "3.20", "3.21", "3.22"]),
     ]
 
     montant_ranges_by_section = []
@@ -525,9 +529,17 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
                     quantite = poste.get("quantite_m2")
             indispo = quantite is None
 
+            # Repli sur la désignation/unité calculées par le pipeline
+            # (poste['designation_devis']/['unite']) quand le code n'a pas
+            # encore d'entrée dans knowledge_base.json -- sans ça, les
+            # postes 3.11 à 3.22 (pas encore dans la base de prix) affichaient
+            # juste "3.11" comme désignation et une unité vide.
+            designation = info.get("designation") or (poste.get("designation_devis") if poste else None) or code
+            unite = info.get("unite") or (poste.get("unite") if poste else None) or ""
+
             ws.cell(row=row, column=1, value=code).border = border
-            ws.cell(row=row, column=2, value=info.get("designation", code)).border = border
-            ws.cell(row=row, column=3, value=info.get("unite", "")).border = border
+            ws.cell(row=row, column=2, value=designation).border = border
+            ws.cell(row=row, column=3, value=unite).border = border
 
             r = row
             if indispo:
@@ -537,15 +549,25 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
                 note_cell = ws.cell(row=row, column=7, value=raisons.get(code) or "Non calculable (donnée hors périmètre ou question non posée).")
                 for cc in (cq, cpu, cm_, note_cell):
                     cc.fill = warn_fill
-            else:
+            elif pu_cell:
                 # Valeur littérale déjà calculée en Python (bilan["volumes_beton"]),
                 # PAS une formule pointant vers une autre feuille -- garantit un
                 # affichage correct même dans un viewer qui ne recalcule pas les
                 # formules à l'ouverture (contrairement à une référence croisée).
                 cq = ws.cell(row=row, column=4, value=round(quantite, 2))
-                cpu = ws.cell(row=row, column=5, value=(f"={pu_cell}" if pu_cell else ""))
+                cpu = ws.cell(row=row, column=5, value=f"={pu_cell}")
                 cm_ = ws.cell(row=row, column=6, value=f"=D{r}*E{r}")
                 note_cell = ws.cell(row=row, column=7, value=raisons.get(code) or "")
+            else:
+                # Quantité connue mais prix unitaire absent de la base de prix
+                # (ex: 3.11-3.22, pas encore renseignés) -- surtout NE PAS
+                # laisser une cellule PU vide se traduire en "0 FCFA" via la
+                # formule D*E (Excel traite une cellule vide comme 0).
+                cq = ws.cell(row=row, column=4, value=round(quantite, 2))
+                cpu = ws.cell(row=row, column=5, value="-")
+                cm_ = ws.cell(row=row, column=6, value="-")
+                note_cell = ws.cell(row=row, column=7, value=raisons.get(code)
+                                     or "Prix unitaire non renseigné dans la base de prix (knowledge_base.json).")
             for cc in (cq, cpu, cm_, note_cell):
                 cc.border = border
                 if cc.column in (4, 5, 6):
@@ -564,7 +586,7 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
         row += 2
 
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    c = ws.cell(row=row, column=1, value="TOTAL INFRASTRUCTURE (postes chiffrés, HTVA)")
+    c = ws.cell(row=row, column=1, value="TOTAL GÉNÉRAL (postes chiffrés, HTVA)")
     c.font = Font(bold=True, size=13)
     c.fill = section_fill
     c.alignment = Alignment(horizontal="right")
@@ -642,7 +664,7 @@ def generate_pdf(devis: dict, out_path: str):
     doc = SimpleDocTemplate(out_path, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
                              leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     story = [
-        Paragraph(f"Bilan — Devis Quantitatif Infrastructure — {devis['projet']}", title_style),
+        Paragraph(f"Bilan — Devis Quantitatif — {devis['projet']}", title_style),
         Paragraph(f"{devis['localisation']} — {date.today().isoformat()}", sub_style),
         Spacer(1, 10),
     ]
@@ -684,7 +706,7 @@ def generate_pdf(devis: dict, out_path: str):
     story.append(Spacer(1, 10))
     total_style = ParagraphStyle("TotalFR", parent=styles["Heading2"], alignment=2)
     story.append(Paragraph(
-        f"TOTAL INFRASTRUCTURE (HTVA) : {_fmt_fcfa(devis['total_infrastructure_fcfa'])} FCFA", total_style))
+        f"TOTAL GÉNÉRAL (HTVA) : {_fmt_fcfa(devis['total_infrastructure_fcfa'])} FCFA", total_style))
 
     story.append(Spacer(1, 14))
     story.append(Paragraph("Autres lots (hors périmètre de cette extraction, à compléter manuellement) :", section_style))

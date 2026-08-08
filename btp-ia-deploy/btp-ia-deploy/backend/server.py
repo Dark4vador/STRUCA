@@ -67,11 +67,41 @@ def _set(job_id, **kwargs):
 
 def _merge_pages_analysees(boq: dict) -> list:
     """Fusionne les listes 'par_page' de chaque agrégation (fondation,
-    longrines, voiles, escaliers, éléments structurels) en une seule liste
-    triée par page, pour l'onglet 'Pages analysées' de l'explorateur.
+    longrines, voiles, escaliers, éléments structurels, poteaux) en une
+    seule liste triée par (fichier, page), pour l'onglet 'Pages analysées'
+    de l'explorateur. Clé composite car en multi-documents deux fichiers
+    différents peuvent chacun avoir une "page 3" -- une clé sur le seul
+    numéro de page fusionnerait à tort leurs entrées.
     Certaines agrégations (ex: escaliers) renvoient directement une liste
-    d'éléments -- chaque élément y porte déjà sa propre clé 'page'."""
+    d'éléments -- chaque élément y porte déjà ses propres clés 'fichier'/'page'.
+
+    'poteaux' est traité à part : sa forme n'est pas un 'par_page' plat
+    (contrairement aux autres agrégations) mais imbrique 'par_page_source'
+    (pages qui ont servi de source pour le total, fondation ou repli
+    longrine) et 'poteaux_coffrage.par_page' (comptage séparé par étage) --
+    sans ce traitement dédié, les pages de plan de coffrage n'apparaissaient
+    jamais dans cet onglet d'audit, ce qui devient un vrai problème
+    maintenant que la catégorie 'coffrage' est réactivée pour la
+    superstructure."""
     pages = {}
+
+    def _feed(section_key, items):
+        for p in items:
+            if not isinstance(p, dict):
+                continue
+            page_num = p.get("page")
+            if page_num is None:
+                continue
+            fichier = p.get("fichier")
+            key = (fichier, page_num)
+            entry = pages.setdefault(key, {"fichier": fichier, "page": page_num, "categories": [], "detail": []})
+            cat = p.get("category") or section_key
+            if cat not in entry["categories"]:
+                entry["categories"].append(cat)
+            detail = {k: v for k, v in p.items() if k not in ("page", "category", "fichier")}
+            if detail:
+                entry["detail"].append({"source": section_key, **detail})
+
     for section_key, section in (boq or {}).items():
         if isinstance(section, dict):
             items = section.get("par_page") or []
@@ -79,20 +109,13 @@ def _merge_pages_analysees(boq: dict) -> list:
             items = section
         else:
             items = []
-        for p in items:
-            if not isinstance(p, dict):
-                continue
-            page_num = p.get("page")
-            if page_num is None:
-                continue
-            entry = pages.setdefault(page_num, {"page": page_num, "categories": [], "detail": []})
-            cat = p.get("category") or section_key
-            if cat not in entry["categories"]:
-                entry["categories"].append(cat)
-            detail = {k: v for k, v in p.items() if k not in ("page", "category")}
-            if detail:
-                entry["detail"].append({"source": section_key, **detail})
-    return sorted(pages.values(), key=lambda e: e["page"])
+        _feed(section_key, items)
+
+    poteaux = (boq or {}).get("poteaux") or {}
+    _feed("poteaux", poteaux.get("par_page_source") or [])
+    _feed("poteaux_coffrage", (poteaux.get("poteaux_coffrage") or {}).get("par_page") or [])
+
+    return sorted(pages.values(), key=lambda e: (e["fichier"] or "", e["page"]))
 
 
 def _finalize(job_id: str):
@@ -129,14 +152,16 @@ def _finalize(job_id: str):
         _set(job_id, phase="error", error=str(e), done=True)
 
 
-def _run_job(job_id: str, pdf_path: str):
+def _run_job(job_id: str, pdf_paths: list):
     def on_log(msg: str):
         JOBS[job_id]["stage"] = msg
         JOBS[job_id]["progress"] = min(60, JOBS[job_id]["progress"] + 2)
 
     try:
-        _set(job_id, phase="extraction", stage="Analyse du document...", progress=2)
-        result = run_pipeline(pdf_path, on_log=on_log)
+        stage = ("Analyse du document..." if len(pdf_paths) == 1
+                  else f"Analyse de {len(pdf_paths)} documents...")
+        _set(job_id, phase="extraction", stage=stage, progress=2)
+        result = run_pipeline(pdf_paths, on_log=on_log)
 
         if not result.get("boq"):
             _set(job_id, phase="error", done=True,
@@ -166,18 +191,32 @@ async def api_run(files: list[UploadFile] = File(...),
         return JSONResponse({"error": "Aucun fichier reçu."}, status_code=400)
 
     job_id = str(uuid.uuid4())
-    pdf_file = files[0]
-    pdf_path = UPLOADS_DIR / f"{job_id}_{pdf_file.filename}"
-    with open(pdf_path, "wb") as f:
-        shutil.copyfileobj(pdf_file.file, f)
+    # Un sous-dossier par job pour garder les noms de fichiers d'origine
+    # intacts (utilisés comme libellé "fichier" dans l'audit multi-documents
+    # -- voir pipeline.run_pipeline) sans risque de collision entre jobs.
+    job_dir = UPLOADS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_paths = []
+    for uploaded in files:
+        if not uploaded.filename or not uploaded.filename.lower().endswith(".pdf"):
+            return JSONResponse(
+                {"error": f"Fichier non supporté: {uploaded.filename or '(sans nom)'} -- seuls les PDF sont acceptés."},
+                status_code=400,
+            )
+        dest = job_dir / uploaded.filename
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(uploaded.file, f)
+        pdf_paths.append(str(dest))
 
     JOBS[job_id] = {
         "phase": "extraction", "progress": 0, "stage": "En file d'attente...",
         "done": False, "error": None, "files": [], "missing_info": [],
         "bilan": None, "boq": None, "answers": {}, "devis": None, "pages_analysees": [],
         "project_name": project_name, "location": location,
+        "source_files": [Path(p).name for p in pdf_paths],
     }
-    threading.Thread(target=_run_job, args=(job_id, str(pdf_path)), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, pdf_paths), daemon=True).start()
     return {"job_id": job_id}
 
 

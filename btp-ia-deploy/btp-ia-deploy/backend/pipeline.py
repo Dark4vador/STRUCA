@@ -20,9 +20,24 @@ Passe 3 (agrégation) : calcul 100% déterministe en Python (pas de LLM)
 des totaux, avec détail par page, dédupliqué à travers les pages par
 (désignation, repère début, repère fin) -- normalisé (espaces/casse) pour
 éviter les faux doublons/faux distincts dus au bruit de lecture.
+
+Multi-documents : run_pipeline() accepte une LISTE de PDF (ex: "Plan de
+Fondation.pdf" + "Note de calcul.pdf" + "Plan de Coffrage R+1.pdf" envoyés
+comme fichiers séparés plutôt qu'un seul PDF fusionné). Passe 1 et Passe 2
+tournent sur l'ensemble des pages de TOUS les fichiers réunis dans un même
+pool -- chaque page retenue porte son fichier d'origine ("fichier") en plus
+de son numéro de page LOCAL à ce fichier ("page"), pour l'audit. Passe 3
+agrège across-fichiers exactement comme elle agrège across-pages: aucune
+distinction n'est faite entre "page 4 du même PDF" et "page 2 d'un PDF
+séparé" -- c'est ce qui permet de lire les longrines sur le plan de
+fondation (fichier A) même quand aucun "plan de longrine" dédié n'existe
+dans le lot de fichiers envoyés (voir _is_valid_longrine_designation et
+LONGRINE_CONTENT_MARKERS dans schemas.py pour le repli complémentaire par
+contenu, indépendant du titre ET du fichier).
 """
 
 import re
+from pathlib import Path
 import fitz  # PyMuPDF
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -53,7 +68,7 @@ def render_page_png(page, dpi=DPI) -> bytes:
     return pix.tobytes("png")
 
 
-def process_page(page_index: int, category: str, image_bytes: bytes, on_log=None) -> dict:
+def process_page(source_file: str, page_index: int, category: str, image_bytes: bytes, on_log=None) -> dict:
     """Un seul appel vision sur la page entière, sans découpage en tuiles.
 
     Historique: on a essayé le découpage en tuiles (pour mieux lire les
@@ -64,7 +79,11 @@ def process_page(page_index: int, category: str, image_bytes: bytes, on_log=None
     légèrement différents d'une tuile/passe à l'autre est difficile à
     dédupliquer de façon fiable). Un seul appel sur la page complète est
     plus lent à égaliser en précision de lecture sur les tout petits
-    libellés, mais ne peut structurellement pas dupliquer un élément."""
+    libellés, mais ne peut structurellement pas dupliquer un élément.
+
+    source_file identifie le PDF d'origine (nom de fichier tel qu'envoyé)
+    -- utile uniquement pour l'audit multi-documents ; page_index reste le
+    numéro de page LOCAL à ce fichier."""
     try:
         if category == "note_calcul":
             prompt, schema = PROMPT_NOTE_CALCUL, SCHEMA_NOTE_CALCUL
@@ -72,12 +91,12 @@ def process_page(page_index: int, category: str, image_bytes: bytes, on_log=None
             prompt, schema = PROMPT_PLAN_EXECUTION, SCHEMA_PLAN_EXECUTION
         data = call_vision_json(image_bytes, prompt, schema)
         if on_log:
-            on_log(f"Page {page_index + 1} ({category}): OK")
-        return {"page": page_index + 1, "category": category, "data": data, "error": None}
+            on_log(f"{source_file} — page {page_index + 1} ({category}): OK")
+        return {"fichier": source_file, "page": page_index + 1, "category": category, "data": data, "error": None}
     except GeminiError as e:
         if on_log:
-            on_log(f"Page {page_index + 1} ({category}): ÉCHEC - {e}")
-        return {"page": page_index + 1, "category": category, "data": None, "error": str(e)}
+            on_log(f"{source_file} — page {page_index + 1} ({category}): ÉCHEC - {e}")
+        return {"fichier": source_file, "page": page_index + 1, "category": category, "data": None, "error": str(e)}
 
 
 # ---------------------------------------------------------------------
@@ -100,7 +119,7 @@ def _aggregate_fondation(pages):
     for r in pages:
         if r["data"] is None or not r["data"].get("semelles"):
             continue
-        per_page.append({"page": r["page"], "semelles": r["data"]["semelles"]})
+        per_page.append({"fichier": r.get("fichier"), "page": r["page"], "semelles": r["data"]["semelles"]})
     return {"par_page": per_page}
 
 
@@ -146,7 +165,7 @@ def _aggregate_poteaux(pages):
                 page_counts[section] = page_counts.get(section, 0) + 1  # audit par page, non dédupliqué
                 if key not in total_seen:
                     total_seen[key] = section
-            per_page.append({"page": r["page"], "nombre_poteaux": len(instances), "detail_par_section": page_counts})
+            per_page.append({"fichier": r.get("fichier"), "page": r["page"], "nombre_poteaux": len(instances), "detail_par_section": page_counts})
 
         total_by_section = {}
         for section in total_seen.values():
@@ -192,7 +211,7 @@ def _aggregate_poteaux(pages):
             page_counts[section] = page_counts.get(section, 0) + 1
             coffrage_total[section] = coffrage_total.get(section, 0) + 1
         coffrage_per_page.append({
-            "page": r["page"], "niveau": r["data"].get("niveau"),
+            "fichier": r.get("fichier"), "page": r["page"], "niveau": r["data"].get("niveau"),
             "nombre_poteaux": len(poteaux), "detail_par_section": page_counts,
         })
 
@@ -246,7 +265,7 @@ def _aggregate_longrines(pages):
             page_count += 1
 
         per_page.append({
-            "page": r["page"], "category": r["category"], "nombre_troncons": page_count,
+            "fichier": r.get("fichier"), "page": r["page"], "category": r["category"], "nombre_troncons": page_count,
             "longueur_totale_m_page": round(page_total_len, 2),
             "troncons_sans_longueur": sum(1 for t in troncons if t.get("longueur_m") is None),
             "entrees_rejetees_cote_numerique": rejetes,
@@ -292,7 +311,7 @@ def _aggregate_voiles(pages):
             if v.get("longueur_m"):
                 page_total_len += v["longueur_m"]
         per_page.append({
-            "page": r["page"], "category": r["category"],
+            "fichier": r.get("fichier"), "page": r["page"], "category": r["category"],
             "nombre_voiles": len(voiles),
             "detail": [
                 {"designation": v["designation"], "de": v.get("repere_debut"), "a": v.get("repere_fin"),
@@ -334,7 +353,7 @@ def _aggregate_escaliers(pages):
         if r["data"] is None or not r["data"].get("escaliers"):
             continue
         for e in r["data"]["escaliers"]:
-            escaliers.append({**e, "page": r["page"]})
+            escaliers.append({**e, "fichier": r.get("fichier"), "page": r["page"]})
     return escaliers
 
 
@@ -354,7 +373,7 @@ def _aggregate_elements_structurels(pages):
         elements = r["data"].get("elements_structurels", [])
         if not elements:
             continue
-        per_page.append({"page": r["page"], "nombre_lignes": len(elements)})
+        per_page.append({"fichier": r.get("fichier"), "page": r["page"], "nombre_lignes": len(elements)})
         for e in elements:
             niveau = e.get("niveau")
             key = (
@@ -508,7 +527,7 @@ def compute_surfaces_superstructure(results: list) -> dict:
         if dp is None and cc is None:
             continue
         par_niveau.append({
-            "page": r["page"], "niveau": r["data"].get("niveau"),
+            "fichier": r.get("fichier"), "page": r["page"], "niveau": r["data"].get("niveau"),
             "surface_dalle_pleine_m2": dp, "surface_plancher_corps_creux_m2": cc,
         })
         if dp is not None:
@@ -1017,41 +1036,67 @@ def build_bilan(boq: dict, surface_dallage: dict, surfaces_superstructure: dict 
     }
 
 
-def run_pipeline(pdf_path: str, on_log=None) -> dict:
-    doc = fitz.open(pdf_path)
-    total_pages = len(doc)
+def run_pipeline(pdf_paths, on_log=None) -> dict:
+    """pdf_paths: un chemin (str, rétrocompatible) OU une liste de chemins
+    -- un par document envoyé (fondation, longrine, coffrage, note de
+    calcul... peuvent être des fichiers séparés). Toutes les pages de tous
+    les documents sont classifiées puis analysées dans un même pool: la
+    Passe 3 agrège across-fichiers exactement comme elle agrège
+    across-pages, donc un plan de fondation envoyé comme fichier séparé
+    du reste sert de repli pour les longrines de la même façon qu'une page
+    de fondation à l'intérieur d'un seul PDF fusionné (voir docstring en
+    tête de fichier)."""
+    if isinstance(pdf_paths, (str, Path)):
+        pdf_paths = [pdf_paths]
 
-    # ---- Passe 1: classification gratuite ----
-    routed_pages = []  # [(page_index, category)]
-    for i in range(total_pages):
-        page = doc[i]
-        title = extract_cartouche_title(page)
-        category = classify_title(title)
-        if category:
-            routed_pages.append((i, category))
+    docs = {}  # label (nom de fichier) -> fitz.Document, dans l'ordre d'envoi
+    for path in pdf_paths:
+        label = Path(path).name
+        if label in docs:
+            # Deux fichiers envoyés avec le même nom -- on désambiguïse
+            # plutôt que d'écraser silencieusement l'un des deux documents.
+            base, dot, ext = label.rpartition(".")
+            label = f"{base or label} ({sum(1 for k in docs if k.startswith(base or label))+1}){dot}{ext}"
+        docs[label] = fitz.open(path)
+
+    total_pages_all = sum(len(d) for d in docs.values())
+
+    # ---- Passe 1: classification gratuite, sur toutes les pages de tous les fichiers ----
+    routed_pages = []  # [(label, page_index, category)]
+    for label, doc in docs.items():
+        for i in range(len(doc)):
+            title = extract_cartouche_title(doc[i])
+            category = classify_title(title)
+            if category:
+                routed_pages.append((label, i, category))
 
     if on_log:
-        on_log(f"Passe 1 terminée: {len(routed_pages)}/{total_pages} pages pertinentes "
-               f"({', '.join(sorted(set(c for _, c in routed_pages)))})")
+        noms = ", ".join(docs.keys())
+        on_log(f"Passe 1 terminée: {len(routed_pages)}/{total_pages_all} pages pertinentes "
+               f"sur {len(docs)} fichier(s) [{noms}] "
+               f"({', '.join(sorted(set(c for _, _, c in routed_pages)))})")
 
     if not routed_pages:
-        doc.close()
+        for doc in docs.values():
+            doc.close()
         return {"pages_analysees": [], "boq": None,
-                "avertissement": "Aucune page pertinente détectée (fondation/longrine/coffrage)."}
+                "avertissement": "Aucune page pertinente détectée (fondation/longrine/coffrage) "
+                                  f"dans {len(docs)} fichier(s) envoyé(s)."}
 
-    # ---- Passe 2: vision ciblée, en parallèle ----
+    # ---- Passe 2: vision ciblée, en parallèle sur l'ensemble des pages retenues ----
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {}
-        for i, category in routed_pages:
-            image_bytes = render_page_png(doc[i])
-            futures[executor.submit(process_page, i, category, image_bytes, on_log)] = i
+        futures = []
+        for label, i, category in routed_pages:
+            image_bytes = render_page_png(docs[label][i])
+            futures.append(executor.submit(process_page, label, i, category, image_bytes, on_log))
 
         for future in as_completed(futures):
             results.append(future.result())
 
-    doc.close()
-    results.sort(key=lambda r: r["page"])
+    for doc in docs.values():
+        doc.close()
+    results.sort(key=lambda r: (r.get("fichier") or "", r["page"]))
 
     # ---- Passe 3: agrégation déterministe (Python, pas de LLM) ----
     boq = build_boq(results)

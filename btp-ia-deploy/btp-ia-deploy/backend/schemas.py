@@ -463,13 +463,12 @@ TITLE_KEYWORDS = {
     # chaînages, appuis de baies... par l'ingénieur BA) -- utilisé pour
     # couvrir la Superstructure (postes 3.11-3.20). Avant, "NOTE DE CALCUL"
     # était dans EXCLUDE_KEYWORDS et la page était purement ignorée.
-    "note_calcul": ["NOTE DE CALCUL"],
-    # "coffrage" volontairement désactivé pour l'instant: on limite le scope
-    # aux plans d'infrastructure (fondation/longrine) pour les premiers
-    # tests du système. Décommente la ligne ci-dessous pour réactiver la
-    # superstructure (poteaux/voiles par étage) une fois l'infrastructure
-    # validée.
-    # "coffrage": ["PLAN DE COFFRAGE"],
+    "note_calcul": ["NOTE DE CALCUL", "MEMOIRE DE CALCUL"],
+    # Réactivé pour couvrir la Superstructure (poteaux/voiles par étage,
+    # postes 3.11+) -- était volontairement désactivé le temps de valider
+    # l'infrastructure seule. `_aggregate_poteaux` sait déjà agréger ces
+    # pages séparément (poteaux_coffrage, par niveau).
+    "coffrage": ["PLAN DE COFFRAGE"],
     # Décommente/complète si ces plans existent dans tes dossiers et sont
     # indispensables au comptage (à valider au cas par cas, pas par défaut):
     # "ferraillage": ["PLAN DE FERRAILLAGE", "DETAIL FERRAILLAGE"],
@@ -484,6 +483,18 @@ EXCLUDE_KEYWORDS = [
     "SOMMAIRE", "GEOTECHNIQUE", "DEVIS",
     "PAGE DE GARDE", "GENERALITES", "MEMOIRE", "RAPPORT",
 ]
+
+
+def _header_line(raw_text: str) -> str:
+    """Première ligne non vide du texte natif de la page -- c'est là que
+    vit quasi toujours le titre/l'intitulé réel de la page, avant tout
+    paragraphe de corps de texte (hypothèses, renvois à d'autres
+    documents, etc.)."""
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 # Repli de contenu (indépendant du titre de la page) : capte le cas où des
@@ -509,10 +520,31 @@ def _page_mentions_longrine(upper_text: str) -> bool:
 def classify_title(raw_title: str) -> str | None:
     """Renvoie une catégorie normalisée ou None si la page doit être
     ignorée (par défaut: tout ce qui n'est pas un plan d'exécution listé
-    dans TITLE_KEYWORDS)."""
-    upper = raw_title.upper()
+    dans TITLE_KEYWORDS).
 
-    if any(kw in upper for kw in EXCLUDE_KEYWORDS):
+    Ordre de vérification (important -- voir le commentaire détaillé
+    au-dessus d'EXCLUDE_KEYWORDS pour le pourquoi) :
+    1) un mot-clé TITLE_KEYWORDS trouvé sur la ligne d'en-tête (le titre
+       réel de la page, presque toujours en première ligne) l'emporte
+       toujours, même si EXCLUDE_KEYWORDS apparaît plus loin dans le
+       corps de la page ;
+    2) sinon, si l'en-tête lui-même annonce un type de page qu'on ne veut
+       jamais traiter (sommaire, rapport géotechnique, devis...), on
+       exclut ;
+    3) sinon, repli : le titre n'est pas toujours sur la toute première
+       ligne (ex: légende avant l'intitulé) -- on le cherche dans le
+       texte entier ;
+    4) dernier repli : marqueurs de contenu longrine, indépendants du
+       titre.
+    """
+    upper = raw_title.upper()
+    header = _header_line(raw_title).upper()
+
+    for category, keywords in TITLE_KEYWORDS.items():
+        if any(kw in header for kw in keywords):
+            return category
+
+    if any(kw in header for kw in EXCLUDE_KEYWORDS):
         return None
 
     for category, keywords in TITLE_KEYWORDS.items():

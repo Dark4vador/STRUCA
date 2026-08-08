@@ -82,12 +82,16 @@
   }
   #drop:hover .upload-icon { transform: translateY(-2px); }
   #drop .drop-sub { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
-  #fileList { margin-top: 14px; font-size: 13px; color: var(--accent-2); line-height: 1.7; display: none; align-items: center; gap: 8px; }
+  #fileList { margin-top: 14px; font-size: 13px; color: var(--accent-2); line-height: 1.7; display: none; align-items: center; gap: 8px; flex-wrap: wrap; }
   #fileList.show { display: flex; animation: popIn 0.25s ease both; }
   #fileList .file-chip {
     display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border-soft);
     padding: 8px 12px; border-radius: 8px; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
   }
+  #fileList .file-chip-remove {
+    border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 12px; padding: 0 0 0 4px;
+  }
+  #fileList .file-chip-remove:hover { color: var(--text); }
 
   .btn {
     font-family: var(--font-sans); font-size: 14px; font-weight: 500; padding: 10px 20px; border-radius: 8px;
@@ -111,6 +115,12 @@
   .spinner {
     width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--border);
     border-top-color: var(--accent-2); animation: spin 0.7s linear infinite; flex-shrink: 0;
+  }
+  .spinner-done {
+    width: 13px; height: 13px; border-radius: 50%; flex-shrink: 0;
+    background: var(--accent); color: #06120e; font-size: 9px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; line-height: 1;
+    animation: none;
   }
   #progressPct { font-family: var(--font-mono); font-size: 12.5px; color: var(--accent-2); font-weight: 600; }
 
@@ -246,7 +256,7 @@
       <div class="brand-icon">&#9635;</div>
       <div class="brand-text">
         <h1>BTP &mdash; IA</h1>
-        <p>Devis Quantitatif &middot; Infrastructure</p>
+        <p>Devis Quantitatif</p>
       </div>
     </div>
   </div>
@@ -254,15 +264,15 @@
   <h2 class="page-title">Générateur de metré</h2>
 
   <div class="card">
-    <p class="section-label">Import du PDF (plans d'exécution)</p>
+    <p class="section-label">Import des plans (PDF, plusieurs fichiers acceptés)</p>
 
     <div id="drop">
       <div class="upload-icon">&#8593;</div>
-      <div>Glisse ton PDF ici, ou clique pour choisir</div>
-      <div class="drop-sub">Fondations · longrines · voiles · escaliers</div>
+      <div>Glisse tes PDF ici, ou clique pour choisir</div>
+      <div class="drop-sub">Fondation · longrines · coffrage · note de calcul · architecture — un ou plusieurs fichiers</div>
     </div>
-    <input type="file" id="fileInput" accept="application/pdf" style="display:none">
-    <div id="fileList"><span class="file-chip" id="fileChip"></span></div>
+    <input type="file" id="fileInput" accept="application/pdf" multiple style="display:none">
+    <div id="fileList"></div>
 
     <hr class="sep">
 
@@ -281,7 +291,7 @@
 
     <div id="progressWrap" class="hidden">
       <div class="progress-head">
-        <div id="stageText"><span class="spinner"></span><span id="stageLabel">En attente...</span></div>
+        <div id="stageText"><span class="spinner" id="stageSpinner"></span><span id="stageLabel">En attente...</span></div>
         <div id="progressPct">0%</div>
       </div>
       <div id="progressBar"><div id="progressFill"></div></div>
@@ -335,26 +345,48 @@
 </div>
 
 <script>
-let selectedFile = null;
+let selectedFiles = []; // File[] -- plusieurs documents acceptés (fondation, longrines, coffrage... séparés ou non)
 let currentJobId = null;
 const missingFiles = {}; // key -> File
 
 const drop = document.getElementById('drop');
 const fileInput = document.getElementById('fileInput');
 const fileList = document.getElementById('fileList');
-const fileChip = document.getElementById('fileChip');
 
 drop.addEventListener('click', () => fileInput.click());
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
-drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('dragover'); setFile(e.dataTransfer.files[0]); });
-fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('dragover'); addFiles(e.dataTransfer.files); });
+fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
 
-function setFile(f) {
-  if (!f) return;
-  selectedFile = f;
-  fileChip.textContent = `📄 ${f.name} · ${(f.size/1024).toFixed(0)} Ko`;
-  fileList.classList.add('show');
+function addFiles(fileListArg) {
+  for (const f of fileListArg) {
+    const isPdf = f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
+    if (!isPdf) continue;
+    const already = selectedFiles.some(sf => sf.name === f.name && sf.size === f.size);
+    if (!already) selectedFiles.push(f);
+  }
+  renderFileList();
+}
+
+function removeFile(idx) {
+  selectedFiles.splice(idx, 1);
+  renderFileList();
+}
+
+function renderFileList() {
+  fileList.innerHTML = '';
+  selectedFiles.forEach((f, idx) => {
+    const chip = document.createElement('span');
+    chip.className = 'file-chip';
+    chip.innerHTML = `📄 ${f.name} · ${(f.size/1024).toFixed(0)} Ko` +
+      `<button type="button" class="file-chip-remove" data-idx="${idx}" title="Retirer">✕</button>`;
+    fileList.appendChild(chip);
+  });
+  fileList.classList.toggle('show', selectedFiles.length > 0);
+  fileList.querySelectorAll('.file-chip-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeFile(parseInt(btn.dataset.idx, 10)));
+  });
 }
 
 function showError(msg) {
@@ -375,13 +407,17 @@ function updateStepper(phase) {
   document.querySelectorAll('.step').forEach(el => {
     const stepIdx = STEP_PHASES.indexOf(el.dataset.phase);
     el.classList.remove('active', 'done');
-    if (stepIdx < idx) el.classList.add('done');
+    // La dernière étape ('done') doit elle aussi passer en .done (pastille
+    // pleine, statique) une fois qu'on l'atteint -- avant, stepIdx === idx
+    // la laissait en .active pour toujours (pastille qui pulse sans fin),
+    // puisqu'aucune étape suivante n'existe pour la faire basculer en .done.
+    if (stepIdx < idx || (stepIdx === idx && effective === 'done')) el.classList.add('done');
     else if (stepIdx === idx) el.classList.add('active');
   });
 }
 
 document.getElementById('generateBtn').addEventListener('click', async () => {
-  if (!selectedFile) { showError('Ajoute un PDF avant de continuer.'); return; }
+  if (!selectedFiles.length) { showError('Ajoute au moins un PDF avant de continuer.'); return; }
   clearError();
   document.getElementById('results').classList.add('hidden');
   document.getElementById('missingCard').classList.add('hidden');
@@ -390,11 +426,16 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
   document.getElementById('progressFill').style.width = '0%';
   document.getElementById('progressFill').classList.remove('done-fill');
   document.getElementById('progressPct').textContent = '0%';
-  document.getElementById('stageLabel').textContent = 'Envoi du fichier...';
+  const stageSpinner = document.getElementById('stageSpinner');
+  stageSpinner.classList.remove('spinner-done');
+  stageSpinner.classList.add('spinner');
+  stageSpinner.textContent = '';
+  document.getElementById('stageLabel').textContent = selectedFiles.length > 1
+    ? `Envoi de ${selectedFiles.length} fichiers...` : 'Envoi du fichier...';
   updateStepper('extraction');
 
   const formData = new FormData();
-  formData.append('files', selectedFile);
+  selectedFiles.forEach(f => formData.append('files', f));
   formData.append('project_name', document.getElementById('projetNom').value || 'Projet BTP');
   formData.append('location', document.getElementById('localisation').value || '');
 
@@ -514,6 +555,10 @@ function pollStatus(jobId) {
     } else if (job.done) {
       clearInterval(interval);
       document.getElementById('progressFill').classList.add('done-fill');
+      const stageSpinner = document.getElementById('stageSpinner');
+      stageSpinner.classList.remove('spinner');
+      stageSpinner.classList.add('spinner-done');
+      stageSpinner.textContent = '✓';
       document.getElementById('generateBtn').disabled = false;
       document.getElementById('results').classList.remove('hidden');
       const links = document.getElementById('fileLinks');
@@ -593,7 +638,7 @@ function renderExploreTab() {
 function renderDevisTab(data) {
   const devis = data.devis || {};
   let html = `<div class="ex-cards">
-    <div class="ex-card"><div class="ex-card-label">Total infrastructure (HTVA)</div><div class="ex-card-value">${fmtFcfa(devis.total_infrastructure_fcfa)}</div></div>
+    <div class="ex-card"><div class="ex-card-label">Total (HTVA)</div><div class="ex-card-value">${fmtFcfa(devis.total_infrastructure_fcfa)}</div></div>
     <div class="ex-card"><div class="ex-card-label">Postes à compléter</div><div class="ex-card-value">${(devis.postes_a_completer_manuellement || []).length}</div></div>
   </div>`;
 
