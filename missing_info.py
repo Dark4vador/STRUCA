@@ -747,6 +747,24 @@ def apply_answers_to_bilan(bilan: dict, answers: dict) -> dict:
             (_section_width_m(item["section"]) or 0) * item["longueur_totale_m"]
             for item in bilan.get("longrines_par_section", [])
         )
+        # v48 -- bug corrigé: cette largeur ne venait QUE de longrines_par_section
+        # (le cas "tronçons individuellement désignés"), jamais du réseau
+        # continu confirmé par l'utilisateur (longueur_reseau_longrine_totale
+        # + section la plus grosse) -- le cas réel le plus fréquent. Résultat
+        # avant ce correctif: poste 2.4 systématiquement à 0 dès que le
+        # réseau continu était utilisé (poste 3.7), alors que la longueur
+        # développée était pourtant déjà connue et confirmée.
+        if not bilan.get("longrines_par_section"):
+            _longueur_reseau_24 = answers.get("longueur_reseau_longrine_totale")
+            _types_valides_24 = [
+                t for t in (bilan.get("longrines_reseau_continu") or [])
+                if _normalise_type(t.get("type_designation")) not in EXCLUS_RESEAU_LONGRINES
+            ]
+            if _longueur_reseau_24 and _types_valides_24:
+                _section_max_24 = _section_max(_types_valides_24)
+                _largeur_24 = _section_width_m(_section_max_24["section"]) if _section_max_24 else None
+                if _largeur_24 is not None:
+                    largeur_longrines = _largeur_24 * _longueur_reseau_24
         vol_fouilles_rigoles = largeur_longrines * profondeur * marge
         postes["fouilles_rigoles_fondations"] = {
             "designation_devis": "2.4 Fouilles en rigoles pour fondations filantes", "unite": "m3",
