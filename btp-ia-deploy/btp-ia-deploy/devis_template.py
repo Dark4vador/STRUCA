@@ -4,19 +4,12 @@ fourni (Canevas_CADRE_DU_DEVIS_QUANTITATIF.xlsx). Sert de référence commune
 pour la génération Excel et PDF, afin que la sortie ressemble exactement au
 document officiel attendu par le client.
 
-Le pipeline calcule automatiquement la section III en entier -- Infrastructures
-(postes 3.1 à 3.10, depuis fondation/longrine/voiles soubassement) ET
-Superstructures (postes 3.11 à 3.22, depuis la note de calcul + le plan
-archi/coffrage -- voir build_volumes_beton dans pipeline.py) -- plus une
-partie de la section II (terrassements liés aux fouilles). Le poste 3.18
-(escaliers superstructure) reste volontairement toujours "à compléter" pour
-éviter un double comptage avec 3.9/3.10 (voir pipeline.py). Les prix
-unitaires 3.11 à 3.22 ne sont pas encore renseignés dans knowledge_base.json
--- les quantités s'affichent, le prix/montant restent vides jusqu'à leur
-ajout. Tout le reste (généralités, maçonnerie, menuiseries, lots
-techniques...) est hors périmètre de l'extraction plans -> on garde les
-intitulés officiels mais on laisse quantité/prix vides, avec une note
-explicite, plutôt que d'inventer des chiffres.
+Le pipeline actuel ne calcule automatiquement que l'INFRASTRUCTURE (section
+III, postes 3.1 à 3.10) + une partie de la section II (terrassements liés
+aux fouilles). Tout le reste (généralités, superstructure, maçonnerie,
+menuiseries, lots techniques...) est hors périmètre de l'extraction plans
+-> on garde les intitulés officiels mais on laisse quantité/prix vides,
+avec une note explicite, plutôt que d'inventer des chiffres.
 """
 
 SECTION_I_GENERALITES = {
@@ -39,13 +32,21 @@ SECTION_II_TERRASSEMENT = {
 SECTION_III_BETON = {
     "numero": "III", "titre": "BETON - BETON ARME", "hors_perimetre": False,
     "sous_sections": [
-        {"titre": "Infrastructures", "codes": ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10"]},
-        {"titre": "Superstructures", "hors_perimetre": False,
-         "note": "Quantités calculées depuis la note de calcul et le plan archi/coffrage. Prix unitaires "
-                 "3.11 à 3.22 pas encore renseignés dans la base de prix -- à compléter (voir knowledge_base.json). "
-                 "Le poste 3.18 (escaliers) reste volontairement à compléter manuellement, pour éviter un "
-                 "double comptage avec 3.9/3.10.",
-         "codes": ["3.11", "3.12", "3.13", "3.14", "3.15", "3.16", "3.17", "3.18", "3.19", "3.20", "3.21", "3.22"]},
+        {"titre": "Infrastructures", "codes": ["3.1", "3.2", "3.3", "3.4", "3.5", "3.5bis", "3.6", "3.7", "3.8", "3.9", "3.10"]},
+        # v41 -- Superstructures partiellement couvertes: poteaux (3.11) et
+        # voiles (3.13) par étage, lus sur les plans de coffrage (mêmes
+        # champs d'extraction que l'infrastructure, juste une catégorie de
+        # page longtemps désactivée -- voir schemas.py TITLE_KEYWORDS).
+        # Le reste (poutres, chaînages, raidisseurs superstructure, appuis
+        # de baies, dalle pleine, escaliers étage, éléments décoratifs,
+        # rampes, plancher corps creux) nécessite soit un schéma
+        # d'extraction non encore construit (bordereau de poutres / note de
+        # calcul dédiée), soit des documents non fournis -- reste hors
+        # périmètre tant que ça n'est pas ajouté.
+        {"titre": "Superstructures", "codes": ["3.11", "3.12", "3.13", "3.14", "3.15"]},
+        {"titre": "Superstructures (reste)", "hors_perimetre": True,
+         "note": "Nécessite un bordereau dédié ou des plans de niveau supplémentaires (appuis de baies, dalle pleine, escaliers d'étage, éléments décoratifs, rampes, plancher corps creux) -- non traité par ce pipeline pour l'instant.",
+         "codes_officiels": ["3.16", "3.17", "3.18", "3.19", "3.20", "3.21", "3.22"]},
     ],
 }
 
@@ -67,25 +68,17 @@ POSTE_KEY_TO_CODE = {
     "semelles_isolees_beton_arme": "3.3",
     "radier_semelles_filantes": "3.4",
     "potelets": "3.5",
+    "raidisseurs_soubassement": "3.5bis",
     "voiles_soubassement": "3.6",
+    "poteaux_superstructure": "3.11",
+    "raidisseurs_superstructure": "3.12",
+    "voiles_superstructure": "3.13",
+    "poutres_superstructure": "3.14",
+    "chainage_superstructure": "3.15",
     "longrines": "3.7",
     "dallage": "3.8",
     "marches_arrets_dallage_rampe": "3.9",
     "beche_escalier": "3.10",
     "fouilles_puits_semelles": "2.3",
     "fouilles_rigoles_fondations": "2.4",
-    # Superstructure (postes 3.11 à 3.22) -- voir SUPERSTRUCTURE_TYPES et le
-    # bloc surfaces_superstructure dans pipeline.build_volumes_beton.
-    "poteaux_superstructure": "3.11",
-    "raidisseurs_superstructure": "3.12",
-    "voiles_superstructure": "3.13",
-    "poutres_superstructure": "3.14",
-    "chainages_superstructure": "3.15",
-    "appuis_baies_superstructure": "3.16",
-    "dalle_pleine_superstructure": "3.17",
-    "escaliers_superstructure": "3.18",
-    "elements_decoratifs_superstructure": "3.19",
-    "rampes_acces_superstructure": "3.20",
-    "plancher_corps_creux": "3.21",
-    "table_compression": "3.22",
 }

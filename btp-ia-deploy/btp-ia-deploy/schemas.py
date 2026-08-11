@@ -11,8 +11,6 @@ est systématiquement analysée pour TOUS les types d'éléments possibles;
 les listes restent simplement vides pour ce qui n'est pas présent.
 """
 
-import re
-
 SCHEMA_PLAN_EXECUTION = {
     "type": "object",
     "additionalProperties": False,
@@ -63,9 +61,54 @@ SCHEMA_PLAN_EXECUTION = {
                     "designation": {"type": "string"},
                     "a_cm": {"type": "string"},
                     "b_cm": {"type": "string"},
+                    "quantite": {
+                        "type": ["integer", "null"],
+                        "description": (
+                            "Si la légende a une colonne 'Quantité' (ou équivalent) donnant le "
+                            "nombre d'exemplaires de CE type précis, reporte-la ici -- c'est la "
+                            "source la PLUS FIABLE pour le nombre de poteaux de ce type, bien plus "
+                            "que compter les symboles un par un sur une grille dense. Null si la "
+                            "légende n'a pas cette colonne ou que la case est vide pour cette ligne."
+                        ),
+                    },
                 },
-                "required": ["designation", "a_cm", "b_cm"],
+                "required": ["designation", "a_cm", "b_cm", "quantite"],
             },
+        },
+        "raidisseurs_legende": {
+            "type": "array",
+            "description": (
+                "Certaines légendes combinent poteaux ET raidisseurs dans le même tableau, "
+                "distingués par une ligne récapitulative séparée (ex: 'Total Poteaux : 121' PUIS "
+                "'Total Raidisseur : 87' plus bas dans le même tableau). Les lignes situées APRÈS "
+                "'Total Poteaux' et AVANT/JUSQU'À 'Total Raidisseur' sont des raidisseurs, pas des "
+                "poteaux -- reporte-les ICI, séparément de poteaux_legende, avec leur quantité si "
+                "donnée. Un raidisseur se reconnaît aussi à son intitulé (souvent préfixé R0, R1, "
+                "R2, R3...) ou à 'Plot'. Liste vide si aucun raidisseur distinct n'est listé."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "designation": {"type": "string"},
+                    "a_cm": {"type": "string"},
+                    "b_cm": {"type": "string"},
+                    "quantite": {"type": ["integer", "null"]},
+                },
+                "required": ["designation", "a_cm", "b_cm", "quantite"],
+            },
+        },
+        "poteaux_total_legende_global": {
+            "type": ["integer", "null"],
+            "description": (
+                "Si un TOTAL global de poteaux est écrit explicitement en toutes lettres près de "
+                "la légende poteaux (ex: 'Total Poteaux : 121'), reporte ce nombre ici -- "
+                "INDÉPENDAMMENT de ce que tu comptes dans poteaux_instances. Sur une grille très "
+                "dense (beaucoup de poteaux rapprochés, trame de calepinage serrée), ce total "
+                "imprimé est plus fiable qu'un comptage visuel poteau par poteau -- remplis ce "
+                "champ dans TOUS les cas où un tel total est visible, même si tu remplis aussi "
+                "poteaux_instances par ailleurs. Null si aucun total de ce type n'est écrit."
+            ),
         },
         "poteaux_instances": {
             "type": "array",
@@ -103,6 +146,35 @@ SCHEMA_PLAN_EXECUTION = {
                 "required": ["designation", "section", "repere_debut", "repere_fin", "longueur_m"],
             },
         },
+        "longrines_reseau_continu": {
+            "type": "array",
+            "description": (
+                "Cas DIFFÉRENT de 'longrines' ci-dessus. Certains plans (souvent les gros projets "
+                "avec calepinage dense) ne désignent PAS chaque tronçon individuellement -- ils "
+                "dessinent un RÉSEAU CONTINU qui court le long de (quasi) toutes les lignes de la "
+                "grille de poteaux, avec un ou quelques types GÉNÉRIQUES donnés dans la légende "
+                "(ex: 'Longrine-Type 20x40', parfois 'Bèche 20x40', 'Béton banché 40x40' à côté). "
+                "Si tu observes ce cas -- aucune désignation individuelle du style LG1/LG2 à "
+                "chaque tronçon, mais un type générique en légende s'appliquant à tout le réseau -- "
+                "remplis CE champ (une entrée par type générique de la légende) et laisse "
+                "'longrines' vide. N'invente JAMAIS des désignations de tronçon (LG1, LG2...) qui "
+                "n'existent pas sur le plan juste pour remplir 'longrines' -- utilise ce champ à la "
+                "place. Liste vide si le plan désigne bien chaque tronçon individuellement (dans "
+                "ce cas utilise 'longrines' normalement, pas celui-ci)."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "type_designation": {
+                        "type": "string",
+                        "description": "Libellé du type générique tel qu'écrit dans la légende, ex: 'Longrine-Type', 'Bèche', 'Béton banché'.",
+                    },
+                    "section": {"type": "string", "description": "Section en cm telle qu'écrite, ex: '20x40'."},
+                },
+                "required": ["type_designation", "section"],
+            },
+        },
         "voiles_instances": {
             "type": "array",
             "description": "Une entrée par voile (mur en béton armé) visible -- rectangle ALLONGÉ hachuré/grisé, souvent libellé V1, V2... Différent d'un poteau (carré/rond isolé) et d'une longrine (trait fin). Un même noyau/cage peut avoir plusieurs côtés avec des désignations différentes (V1 pour les côtés horizontaux, V2 pour les côtés verticaux par exemple) -- traite chaque côté comme une entrée séparée.",
@@ -131,6 +203,96 @@ SCHEMA_PLAN_EXECUTION = {
                 "largeur_y_m": {"type": ["number", "null"]},
             },
             "required": ["longueur_x_m", "largeur_y_m"],
+        },
+        "grille_axes": {
+            "type": "object",
+            "additionalProperties": False,
+            "description": (
+                "Repli v30 -- pour calculer automatiquement la longueur développée d'un RÉSEAU "
+                "CONTINU de longrines (voir longrines_reseau_continu) sans compter chaque tronçon "
+                "un par un: lis la chaîne de cotes INDIVIDUELLES entre axes consécutifs (pas la "
+                "cote cumulée totale) sur CHAQUE bord du plan où une grille de repères d'axes est "
+                "visible (les cercles numérotés/lettrés en bordure, ex: '1', '2', '3'... ou 'A', "
+                "'B', 'C'...). C'est exactement la même donnée qu'un humain utiliserait pour "
+                "calculer cette longueur à la main: additionner les cotes entre axes, multiplier "
+                "par le nombre de lignes de la grille dans l'autre sens. Remplis ce champ chaque "
+                "fois qu'une grille d'axes avec ses cotes intermédiaires est visible, même si "
+                "poteaux_total_legende_global ou longrines_reseau_continu ne sont pas remplis sur "
+                "CETTE page précise (l'agrégation se fait ensuite au niveau du dossier entier)."
+            ),
+            "properties": {
+                "cotes_intermediaires_x_m": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": (
+                        "Liste ORDONNÉE des cotes individuelles entre axes consécutifs le long de "
+                        "la direction X (horizontale), dans l'ordre où elles apparaissent sur le "
+                        "plan (ex: [5.20, 3.80, 4.00, 5.20]). PAS la cote cumulée totale -- les "
+                        "valeurs intermédiaires uniquement. Liste vide si aucune chaîne de cotes X "
+                        "n'est visible sur cette page."
+                    ),
+                },
+                "nombre_axes_y": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Nombre de lignes de repères d'axes dans la direction Y (verticale) visibles "
+                        "sur le plan (compte les cercles de repère le long d'un bord vertical, ex: "
+                        "'A', 'B', 'C'... jusqu'à la dernière lettre/numéro utilisé) -- c'est le "
+                        "nombre de lignes de grille horizontales que compte le réseau. Null si non "
+                        "déterminable sur cette page."
+                    ),
+                },
+                "cotes_intermediaires_y_m": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "Même principe que cotes_intermediaires_x_m, mais pour la direction Y (verticale).",
+                },
+                "nombre_axes_x": {
+                    "type": ["integer", "null"],
+                    "description": "Même principe que nombre_axes_y, mais nombre de lignes de repères d'axes dans la direction X.",
+                },
+            },
+            "required": ["cotes_intermediaires_x_m", "nombre_axes_y", "cotes_intermediaires_y_m", "nombre_axes_x"],
+        },
+        "poutres_instances": {
+            "type": "array",
+            "description": (
+                "v42 -- une entrée par poutre individuellement désignée et cotée visible sur un "
+                "plan de coffrage/poutraison (ex: 'PT1 25x40', avec sa portée). Cherche un tableau "
+                "LEGENDE POUTRES si présent (retranscris chaque ligne), sinon les désignations "
+                "directement inline sur le dessin avec leur section et leur portée (longueur entre "
+                "appuis). N'invente jamais une portée non cotée -- laisse longueur_m à null dans ce "
+                "cas plutôt que de deviner. Liste vide si aucune poutre individuellement cotée n'est "
+                "visible sur cette page."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "designation": {"type": "string"},
+                    "section": {"type": "string", "description": "Section en cm, ex: '25x40'."},
+                    "longueur_m": {"type": ["number", "null"], "description": "Portée (longueur entre appuis) en m, si cotée."},
+                },
+                "required": ["designation", "section", "longueur_m"],
+            },
+        },
+        "chainage_legende": {
+            "type": "array",
+            "description": (
+                "v43 -- si un chaînage (poste 3.15, béton armé courant le long des murs porteurs à "
+                "un niveau donné) est identifié en légende sur cette page (plan de coffrage), avec "
+                "une section (ex: '20x20'), retranscris-le ici -- une entrée par type/section. Comme "
+                "pour les longrines en réseau continu, un chaînage court généralement sur tout le "
+                "périmètre + refends porteurs -- n'invente pas de longueur, laisse la longueur au "
+                "mécanisme de confirmation utilisateur en aval. Liste vide si aucun chaînage "
+                "identifiable en légende sur cette page."
+            ),
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "designation": {"type": "string"},
+                    "section": {"type": "string", "description": "Section en cm, ex: '20x20'."},
+                },
+                "required": ["designation", "section"],
+            },
         },
         "escaliers": {
             "type": "array",
@@ -191,21 +353,13 @@ SCHEMA_PLAN_EXECUTION = {
                         "required": ["x_m", "y_m"],
                     },
                 },
-                "surface_dalle_pleine_m2": {
-                    "type": ["number", "null"],
-                    "description": "UNIQUEMENT pour un plan de NIVEAU D'ÉTAGE (pas le rez-de-chaussée/dallage sol): si un tableau de surfaces distingue une zone en 'dalle pleine' (souvent balcons, cages d'escalier/ascenseur, loggias) avec un chiffre m² déjà calculé, reporte-le ici. Sert au poste 3.17. Null si non distingué sur cette page.",
-                },
-                "surface_plancher_corps_creux_m2": {
-                    "type": ["number", "null"],
-                    "description": "UNIQUEMENT pour un plan de NIVEAU D'ÉTAGE: surface du plancher en corps creux/poutrelles-hourdis de ce niveau, si un chiffre m² déjà calculé est visible (tableau de surfaces ou mention). Sert aux postes 3.21 (plancher corps creux) et 3.22 (table de compression, même surface). Null si non disponible sur cette page.",
-                },
             },
-            "required": ["surface_totale_m2", "contour_m", "surface_dalle_pleine_m2", "surface_plancher_corps_creux_m2"],
+            "required": ["surface_totale_m2", "contour_m"],
         },
     },
     "required": [
-        "niveau", "semelles", "poteaux_legende", "poteaux_instances",
-        "longrines", "voiles_instances", "dimensions_generales_m", "escaliers", "surface_archi",
+        "niveau", "semelles", "poteaux_legende", "raidisseurs_legende", "poteaux_instances", "poteaux_total_legende_global",
+        "longrines", "longrines_reseau_continu", "voiles_instances", "poutres_instances", "chainage_legende", "dimensions_generales_m", "grille_axes", "escaliers", "surface_archi",
     ],
 }
 
@@ -228,38 +382,115 @@ que le titre du plan suggère autre chose.
    Y). Si tu n'es pas sûr laquelle est la cote totale, laisse à null
    plutôt que de deviner.
 
+2bis) GRILLE D'AXES (repli pour calculer une longueur de réseau continu
+   sans compter chaque tronçon un par un -- voir point 5b plus loin) :
+   à l'INVERSE du point 2 ci-dessus qui ne veut que la cote EXTÉRIEURE
+   totale, ici c'est l'inverse -- lis la chaîne de cotes INTERMÉDIAIRES
+   (chaque segment entre deux repères d'axes consécutifs, PAS le total
+   cumulé) le long de chaque bord où une grille de repères d'axes
+   (cercles numérotés/lettrés) est visible. Reporte cette liste ordonnée
+   dans grille_axes.cotes_intermediaires_x_m (bord horizontal) et
+   cotes_intermediaires_y_m (bord vertical). Compte aussi le nombre de
+   lignes de repères d'axes dans l'autre direction (nombre_axes_y =
+   nombre de repères le long d'un bord vertical, nombre_axes_x = nombre
+   de repères le long d'un bord horizontal) -- ce sont les mêmes repères
+   que ceux utilisés pour repere_grille des poteaux/longrines. Remplis ce
+   champ chaque fois que cette grille est visible, indépendamment de ce
+   que tu remplis ailleurs sur cette page.
+
 3) SEMELLES: si un tableau "LEGENDE SEMELLES" est visible, retranscris-le
    exactement dans semelles. Sinon liste vide. N'invente aucune valeur.
 
 4) POTEAUX:
    a) Si un tableau "LEGENDE POTEAUX" (dimensions par désignation) est
-      visible, retranscris-le dans poteaux_legende.
-   b) Compte et liste CHAQUE poteau individuellement visible sur le
-      dessin dans poteaux_instances (une entrée par point/symbole
-      dessiné avec son repère de grille), même si plusieurs partagent la
-      même désignation. Si la section est écrite en clair à côté du
-      poteau sur CE dessin (ex: "25x60"), reporte-la dans "section" --
-      sinon laisse section à null (elle sera résolue via poteaux_legende
-      si besoin).
+      visible, retranscris-le dans poteaux_legende. Si ce tableau a une
+      colonne "Quantité" (nombre d'exemplaires par type déjà chiffré,
+      ex: "P1 | 25x25 | 57"), reporte cette quantité dans le champ
+      "quantite" de chaque ligne -- c'est la source la PLUS FIABLE pour
+      le nombre de poteaux par type, à privilégier sur un comptage visuel
+      un par un. Si la légende combine poteaux ET raidisseurs dans le
+      même tableau (reconnaissable à une ligne récapitulative "Total
+      Poteaux : N" suivie plus bas d'une autre ligne "Total Raidisseur :
+      M"), les lignes situées après "Total Poteaux" (souvent préfixées
+      R0/R1/R2/R3, ou "Plot") vont dans raidisseurs_legende, PAS dans
+      poteaux_legende -- ne les mélange jamais.
+   b) NE CONFONDS JAMAIS deux symboles très différents qui coexistent
+      souvent sur ces plans:
+      - Les CERCLES numérotés/lettrés en bordure du plan (souvent en
+        rouge, alignés sur le pourtour, avec un numéro ou une lettre
+        comme "10", "12", "A", "B") sont des REPÈRES D'AXES DE GRILLE
+        (convention de calepinage) -- ce ne sont PAS des poteaux, ne les
+        compte jamais comme tels.
+      - Les poteaux réels sont de petits symboles PLEINS (carré ou point
+        noir/plein, parfois hachuré) situés à L'INTÉRIEUR du bâtiment --
+        aux intersections des lignes de grille, aux angles de murs, au
+        milieu des voiles. Ils sont souvent petits et peuvent se
+        confondre visuellement avec la trame de grille dense qui les
+        entoure -- regarde attentivement chaque intersection intérieure
+        avant de conclure qu'aucun poteau n'y est dessiné.
+   c) Compte et liste CHAQUE poteau (au sens du point b ci-dessus)
+      individuellement visible sur le dessin dans poteaux_instances (une
+      entrée par point/symbole dessiné avec son repère de grille), même
+      si plusieurs partagent la même désignation. Si la section est
+      écrite en clair à côté du poteau sur CE dessin (ex: "25x60"),
+      reporte-la dans "section" -- sinon laisse section à null (elle
+      sera résolue via poteaux_legende si besoin). Ce comptage individuel
+      reste utile même quand la légende donne déjà une quantité par type
+      (recoupement/audit) -- mais s'il est trop peu fiable sur une trame
+      dense, la quantité de légende (point a) prime de toute façon.
+      MÉTHODE pour une grille dense (beaucoup de poteaux rapprochés) : ne
+      cherche PAS à voir tout le dessin d'un seul coup d'œil -- balaie-le
+      MÉTHODIQUEMENT, zone par zone ou ligne d'axe par ligne d'axe (ex:
+      toute la bande le long de l'axe "1", puis "2", puis "3"...),
+      intersection par intersection, et note chaque poteau rencontré
+      avant de passer à la bande suivante. C'est ce balayage systématique
+      -- pas un survol global -- qui permet de ne pas en manquer sur une
+      trame chargée.
+   d) TOTAL GLOBAL (grilles très denses, SEULEMENT si la légende n'a PAS
+      de colonne Quantité exploitable par type -- voir point a en
+      priorité) : si un total est écrit en toutes lettres près de la
+      priorité) : si un total est écrit en toutes lettres près de la
+      légende (ex: "Total Poteaux : 121") sans répartition par type
+      associée, reporte ce nombre dans poteaux_total_legende_global. Ne
+      laisse jamais ce cas se traduire par des listes vides silencieuses.
 
-4) LONGRINES: si des tronçons de longrine sont dessinés sur cette page
-   (avec ou sans page dédiée), liste CHAQUE tronçon individuellement
-   dans longrines (jamais un total groupé). Deux pièges à éviter:
-   a) Les libellés utilisent souvent un suffixe numéroté serré (ex:
-      LG8.1, LG8.2, LG8.3... jusqu'à LG8.11) -- vérifie bien CHAQUE
-      suffixe individuellement, ne t'arrête pas au premier chiffre
-      visible.
-   b) NE CONFONDS JAMAIS un libellé de longrine (désignation avec des
-      lettres) avec une COTE DE DISTANCE entre axes (nombres seuls comme
-      "5.20", "3.80" écrits le long des lignes de grille). Une
-      désignation de longrine contient toujours des lettres, jamais un
-      nombre seul.
-   Pour longueur_m, lis la cote déjà annotée sur le plan entre les deux
-   repères -- ne calcule ni n'invente une longueur non explicitement
-   écrite. Si aucune cote fiable n'est visible pour un tronçon, mets
-   longueur_m à null plutôt que de deviner.
+5) LONGRINES:
+   a) Cas normal -- tronçons individuellement désignés (LG1, LG2...) :
+      liste CHAQUE tronçon individuellement dans longrines (jamais un
+      total groupé). Deux pièges à éviter:
+      - Les libellés utilisent souvent un suffixe numéroté serré (ex:
+        LG8.1, LG8.2, LG8.3... jusqu'à LG8.11) -- vérifie bien CHAQUE
+        suffixe individuellement, ne t'arrête pas au premier chiffre
+        visible.
+      - NE CONFONDS JAMAIS un libellé de longrine (désignation avec des
+        lettres) avec une COTE DE DISTANCE entre axes (nombres seuls comme
+        "5.20", "3.80" écrits le long des lignes de grille). Une
+        désignation de longrine contient toujours des lettres, jamais un
+        nombre seul.
+      Pour longueur_m, lis la cote déjà annotée sur le plan entre les deux
+      repères -- ne calcule ni n'invente une longueur non explicitement
+      écrite. Si aucune cote fiable n'est visible pour un tronçon, mets
+      longueur_m à null plutôt que de deviner.
+   b) Cas RÉSEAU CONTINU (fréquent sur les gros projets à trame dense) :
+      si les longrines ne sont PAS désignées tronçon par tronçon mais
+      forment un réseau continu qui suit (quasi) toutes les lignes de la
+      grille de poteaux, avec un ou quelques types génériques donnés en
+      légende (ex: "Longrine-Type 20x40", éventuellement avec "Bèche
+      20x40" et "Béton banché 40x40" séparés à côté) -- NE FORCE JAMAIS
+      des désignations de tronçon inventées pour remplir "longrines".
+      Utilise plutôt longrines_reseau_continu (une entrée par type
+      générique de légende) et laisse "longrines" vide. Reconnaître ce
+      cas : aucune étiquette individuelle du style "LG3" collée à un
+      tronçon précis, mais un simple type + section en légende
+      s'appliquant à l'ensemble du maillage rouge/fin visible sur tout
+      le plan. IMPORTANT: dans ce cas, remplis SYSTÉMATIQUEMENT aussi
+      grille_axes (point 2bis) sur cette même page si la grille de
+      repères d'axes avec ses cotes intermédiaires y est visible -- c'est
+      ce qui permet de calculer automatiquement la longueur développée
+      totale du réseau (somme des cotes × nombre de lignes dans l'autre
+      sens) sans avoir à compter chaque tronçon un par un.
 
-5) VOILES: compte et liste CHAQUE côté de voile visible dans
+6) VOILES: compte et liste CHAQUE côté de voile visible dans
    voiles_instances. Un voile se reconnaît à sa forme: un rectangle
    ALLONGÉ hachuré/grisé (souvent libellé V1, V2...), différent d'un
    poteau (carré/rond isolé, plus petit) et d'une longrine (simple trait
@@ -285,6 +516,23 @@ que le titre du plan suggère autre chose.
       cote d'axe fiable ne permet de la déterminer.
    d) epaisseur_cm: uniquement si explicitement annotée (légende ou cote
       d'épaisseur), sinon null.
+
+6bis) POUTRES (v42, plans de coffrage/poutraison uniquement -- ex: "POUTRES
+   BLOC B", "POUTRES PH-RDC") : si un tableau "LEGENDE POUTRES" est
+   visible, retranscris-le dans poutres_instances. Sinon, si les poutres
+   sont désignées individuellement sur le dessin (ex: "PT1 25x40" écrit
+   le long d'une ligne de poutre), liste chaque poutre avec sa section.
+   Pour longueur_m (portée) : lis la cote déjà annotée entre les deux
+   appuis (poteaux/voiles) si elle existe -- comme pour les voiles, tu
+   peux utiliser les cotes de grille qui bornent la poutre si aucune cote
+   directe n'est écrite dessus. Null si vraiment aucune cote fiable.
+   N'invente jamais une portée.
+
+6ter) CHAÎNAGE (v43, plans de coffrage uniquement) : si un chaînage est
+   identifié en légende avec sa section (ex: "Chaînage 20x20"), retranscris-
+   le dans chainage_legende (type + section, comme pour un réseau continu
+   de longrines). Ne compte JAMAIS une longueur ici -- ce champ ne sert
+   qu'à signaler le type/section trouvé, la longueur sera confirmée en aval.
 
 7) ESCALIER: si une coupe ou un détail d'escalier est visible sur cette
    page (souvent un profil en marches d'un côté, avec des cotes de giron/
@@ -322,124 +570,7 @@ que le titre du plan suggère autre chose.
    n'est déductible avec certitude, laisse les deux champs à null --
    n'invente jamais de coordonnées ou de surface.
 
-10) SURFACES DE PLANCHER D'ÉTAGE (uniquement sur un plan de NIVEAU
-    D'ÉTAGE, pas le rez-de-chaussée/dallage sol): si un tableau de
-    surfaces sur cette page distingue explicitement une zone "dalle
-    pleine" (souvent balcons, cages d'escalier/ascenseur, loggias) avec
-    un chiffre m² déjà calculé, reporte-le dans
-    surface_archi.surface_dalle_pleine_m2. Si le même tableau (ou une
-    autre mention) donne la surface du plancher en corps creux/poutrelles
-    hourdis de ce niveau, reporte-la dans
-    surface_archi.surface_plancher_corps_creux_m2. Laisse à null si non
-    distingué explicitement sur cette page -- ne déduis jamais ces deux
-    surfaces l'une de l'autre ni de surface_totale_m2.
-
 N'invente jamais une valeur non présente sur l'image."""
-
-
-# ---------------------------------------------------------------------
-# Note de calcul de structure (récap déjà chiffré par l'ingénieur BA) --
-# utilisée pour couvrir la Superstructure (postes 3.11 à 3.20). On lit
-# les SECTIONS + LONGUEURS/NOMBRES bruts, PAS un volume m3 déjà calculé:
-# le volume est ensuite recalculé en Python (même philosophie que pour
-# les longrines/voiles d'infrastructure), pour rester auditable et éviter
-# une erreur d'arithmétique du LLM.
-# ---------------------------------------------------------------------
-
-SCHEMA_NOTE_CALCUL = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "elements_structurels": {
-            "type": "array",
-            "description": "Une entrée par ligne du tableau récapitulatif de structure (poteaux, raidisseurs, voiles, poutres, chaînages, appuis de baies, éléments décoratifs, rampes d'accès), telle que présentée dans la note de calcul. Une ligne par section/désignation distincte -- pas de total groupé entre types différents.",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": ["poteau", "raidisseur", "voile", "poutre", "chainage",
-                                 "appui_baie", "element_decoratif", "rampe_acces"],
-                        "description": "Type structurel de la ligne, déduit de son intitulé dans le tableau.",
-                    },
-                    "designation": {"type": "string"},
-                    "niveau": {
-                        "type": ["string", "null"],
-                        "description": "Étage/niveau concerné si précisé dans le tableau (ex: RDC, R+1), sinon null.",
-                    },
-                    "section": {
-                        "type": ["string", "null"],
-                        "description": "Section en cm (ex: '20x20', '15x60'), ou 'D25' pour une section circulaire. Null si non applicable (ex: rampe d'accès).",
-                    },
-                    "nombre": {
-                        "type": ["integer", "null"],
-                        "description": "Nombre d'exemplaires de cette ligne -- pour les éléments comptés à l'unité (poteau, raidisseur, appui_baie, element_decoratif). Null pour les éléments linéaires continus (poutre, chainage, voile) où seule longueur_totale_m compte.",
-                    },
-                    "hauteur_m": {
-                        "type": ["number", "null"],
-                        "description": "Hauteur d'un exemplaire (poteau, raidisseur) ou hauteur du voile, en mètres, telle qu'écrite dans la note. Null si non applicable/non écrite.",
-                    },
-                    "longueur_totale_m": {
-                        "type": ["number", "null"],
-                        "description": "Longueur développée totale déjà annotée dans la note (poutre, chainage, voile, appui_baie filant). Null si non applicable/non écrite -- ne déduis jamais une longueur non explicitement chiffrée dans la note.",
-                    },
-                    "epaisseur_cm": {
-                        "type": ["number", "null"],
-                        "description": "Épaisseur, uniquement pour un voile. Null sinon.",
-                    },
-                    "rampe": {
-                        "type": ["object", "null"],
-                        "additionalProperties": False,
-                        "description": "UNIQUEMENT si type == 'rampe_acces': dimensions de la rampe (longueur x largeur x épaisseur), si chiffrées dans la note. Sinon null.",
-                        "properties": {
-                            "longueur_m": {"type": ["number", "null"]},
-                            "largeur_m": {"type": ["number", "null"]},
-                            "epaisseur_m": {"type": ["number", "null"]},
-                        },
-                        "required": ["longueur_m", "largeur_m", "epaisseur_m"],
-                    },
-                },
-                "required": ["type", "designation", "niveau", "section", "nombre",
-                             "hauteur_m", "longueur_totale_m", "epaisseur_cm", "rampe"],
-            },
-        },
-    },
-    "required": ["elements_structurels"],
-}
-
-PROMPT_NOTE_CALCUL = """Tu analyses une page de NOTE DE CALCUL de structure béton armé
-(français). Cette page contient typiquement un ou plusieurs tableaux
-récapitulatifs listant les éléments de superstructure avec leurs sections,
-longueurs ou nombres.
-
-Pour CHAQUE ligne de CHAQUE tableau pertinent, crée une entrée dans
-elements_structurels avec:
-- type: déduis-le de l'intitulé de la ligne/du tableau (poteau, raidisseur,
-  voile, poutre, chainage, appui_baie, element_decoratif, rampe_acces).
-- section: la section telle qu'écrite (ex: "20x20"), si applicable.
-- nombre: UNIQUEMENT si la ligne compte des exemplaires individuels
-  (poteaux, raidisseurs, appuis de baie ponctuels, éléments décoratifs).
-- hauteur_m: hauteur d'un exemplaire ou d'étage, si écrite (poteaux,
-  raidisseurs, voiles).
-- longueur_totale_m: longueur développée déjà chiffrée dans la note
-  (poutres, chaînages, voiles, appuis de baie filants).
-- epaisseur_cm: uniquement pour un voile.
-- rampe: uniquement pour une rampe d'accès, avec ses 3 dimensions si
-  chiffrées.
-
-RÈGLES IMPORTANTES:
-a) Lis les valeurs BRUTES (sections, longueurs, nombres, hauteurs) telles
-   qu'écrites dans la note -- NE calcule PAS toi-même un volume m3, même
-   si tu en serais capable. Laisse le champ correspondant à null si
-   l'information n'est pas explicitement écrite; le volume sera recalculé
-   en aval de façon déterministe.
-b) Ne mélange jamais deux types différents dans une même entrée.
-c) Si un même type de ligne apparaît pour plusieurs niveaux différents
-   (ex: poteaux RDC et poteaux R+1 avec des sections/hauteurs
-   différentes), crée une entrée SÉPARÉE par niveau -- ne les fusionne
-   jamais en une seule ligne.
-d) N'invente jamais une valeur non présente sur l'image."""
 
 
 # ---------- Classification du titre de page (texte natif -> catégorie) ----------
@@ -457,18 +588,25 @@ d) N'invente jamais une valeur non présente sur l'image."""
 TITLE_KEYWORDS = {
     "fondation": ["PLAN DE FONDATION", "PLAN DE RADIER", "FONDATION - RADIER"],
     "longrine": ["PLAN DE LONGRINE"],
-    "archi": ["PLAN ARCHITECTURE", "PLAN DE MASSE", "PLAN DE NIVEAU", "PLAN ARCHI"],
-    # Slot dédié à la note de calcul de structure (récap déjà chiffré des
-    # sections/longueurs/nombres de poteaux, raidisseurs, voiles, poutres,
-    # chaînages, appuis de baies... par l'ingénieur BA) -- utilisé pour
-    # couvrir la Superstructure (postes 3.11-3.20). Avant, "NOTE DE CALCUL"
-    # était dans EXCLUDE_KEYWORDS et la page était purement ignorée.
-    "note_calcul": ["NOTE DE CALCUL"],
-    # Réactivé pour couvrir la Superstructure (poteaux/voiles par étage,
-    # postes 3.11+) -- était volontairement désactivé le temps de valider
-    # l'infrastructure seule. `_aggregate_poteaux` sait déjà agréger ces
-    # pages séparément (poteaux_coffrage, par niveau).
-    "coffrage": ["PLAN DE COFFRAGE"],
+    "archi": [
+        "PLAN ARCHITECTURE", "PLAN DE MASSE", "PLAN DE NIVEAU", "PLAN ARCHI",
+        "PLAN AMENAGEMENT", "PLAN AMENAGE", "AMENAGEMENT DU REZ",
+        "REZ DE CHAUSSEE", "REZ-DE-CHAUSSEE",
+    ],
+    # v41 -- réactivé: infrastructure validée (Phase 1 superstructure --
+    # poteaux/voiles par étage, postes 3.11/3.13). Les plans de coffrage
+    # donnent poteaux + niveau -- déjà agrégés par pipeline.py
+    # (poteaux_coffrage_par_section) mais jamais utilisés tant que cette
+    # catégorie restait désactivée.
+    # v42 -- élargi: "POUTRES [ZONE]" (ex: "POUTRES BLOC B", "POUTRES PH-
+    # SALLE DE REUNION", "POUTRES PH-RDC") est un intitulé de plan de
+    # coffrage tout aussi courant que "PLAN DE COFFRAGE" -- confirmé en
+    # trouvant plusieurs pages de ce type dans un vrai document (poste
+    # 3.14, jusqu'ici invisible faute de matcher ce filtre). "POUTRES "
+    # (pluriel, espace final) plutôt que "POUTRE" seul: un plan archi
+    # mentionne parfois "Poutre ou chaînage..." en passant (singulier),
+    # ce qui ne doit PAS le faire classer comme coffrage.
+    "coffrage": ["PLAN DE COFFRAGE", "POUTRES ", "COFFRAGE POUTRES", "PLAN DE POUTRAISON"],
     # Décommente/complète si ces plans existent dans tes dossiers et sont
     # indispensables au comptage (à valider au cas par cas, pas par défaut):
     # "ferraillage": ["PLAN DE FERRAILLAGE", "DETAIL FERRAILLAGE"],
@@ -480,29 +618,9 @@ TITLE_KEYWORDS = {
 # mots-clés ci-dessus (ex: une note de calcul qui mentionne "fondation" dans
 # son texte sans être un plan). Vérifié en premier, prioritaire sur le match.
 EXCLUDE_KEYWORDS = [
-    "SOMMAIRE", "GEOTECHNIQUE", "DEVIS",
+    "NOTE DE CALCUL", "SOMMAIRE", "GEOTECHNIQUE", "DEVIS",
     "PAGE DE GARDE", "GENERALITES", "MEMOIRE", "RAPPORT",
 ]
-
-
-# Repli de contenu (indépendant du titre de la page) : capte le cas où des
-# longrines sont dessinées sur une page dont l'intitulé officiel ne
-# correspond à AUCUNE catégorie de TITLE_KEYWORDS -- ex. "PLAN DE COFFRAGE
-# NIVEAU RDC", "PLAN DE CHAINAGE", ou tout intitulé maison non standard.
-# Sans ce repli, une telle page est purement et simplement ignorée en
-# Passe 1 et n'atteint jamais l'appel vision -- les longrines qu'elle
-# contient sont alors invisibles pour tout le reste du pipeline (le
-# schéma unique SCHEMA_PLAN_EXECUTION ne sert à rien si la page n'est
-# jamais envoyée). On cherche soit le mot "LONGRINE" employé seul (sans
-# le "PLAN DE" devant), soit des désignations typiques (LG1, LG8.2...).
-LONGRINE_CONTENT_MARKERS = [
-    re.compile(r"LONGRINE"),
-    re.compile(r"\bLG\s?-?\d{1,3}(\.\d+)?\b"),
-]
-
-
-def _page_mentions_longrine(upper_text: str) -> bool:
-    return any(pat.search(upper_text) for pat in LONGRINE_CONTENT_MARKERS)
 
 
 def classify_title(raw_title: str) -> str | None:
@@ -517,12 +635,4 @@ def classify_title(raw_title: str) -> str | None:
     for category, keywords in TITLE_KEYWORDS.items():
         if any(kw in upper for kw in keywords):
             return category
-
-    # Aucun titre reconnu -- dernier repli avant d'ignorer la page : si des
-    # marqueurs de longrine apparaissent quand même dans le texte natif de
-    # la page (plan mixte avec un intitulé non standard), on la retient
-    # sous la catégorie "longrine" pour qu'elle passe en Passe 2.
-    if _page_mentions_longrine(upper):
-        return "longrine"
-
     return None

@@ -1,9 +1,8 @@
 """
 Construit le JSON du devis final: prend les volumes calculés dans
-bilan['volumes_beton']['postes'] (100% Python, déterministe -- couvre
-infrastructure ET superstructure, postes 3.1 à 3.22) et les transforme en
-lignes de devis chiffrées avec les prix unitaires de la base de
-connaissances. Aucun calcul de quantité n'est délégué au LLM -- Groq
+bilan['volumes_beton']['postes'] (100% Python, déterministe) et les
+transforme en lignes de devis chiffrées avec les prix unitaires de la base
+de connaissances. Aucun calcul de quantité n'est délégué au LLM -- Groq
 n'intervient qu'en aval pour une relecture/synthèse (voir groq_client.py).
 """
 
@@ -19,16 +18,7 @@ def _ligne_from_poste(code: str, poste: dict, kb_postes: dict) -> dict:
     unite = kb.get("unite", poste.get("unite", "m3"))
     pu = kb.get("prix_unitaire_fcfa")
 
-    # La quantité vit sous 'volume_m3' pour les postes en m3 (la grande
-    # majorité), mais sous 'quantite_m2' pour les postes en m2 (3.21/3.22,
-    # plancher corps creux -- voir build_volumes_beton). Sans ce repli, ces
-    # deux postes s'affichaient toujours "indisponible" même quand la
-    # surface était bien connue.
-    qte = poste.get("volume_m3")
-    if qte is None:
-        qte = poste.get("quantite_m2")
-
-    if poste.get("donnee_indisponible") or qte is None:
+    if poste.get("donnee_indisponible") or poste.get("volume_m3") is None:
         return {
             "code": code, "designation": designation, "unite": unite,
             "quantite": None, "prix_unitaire_fcfa": pu, "montant_fcfa": None,
@@ -36,6 +26,7 @@ def _ligne_from_poste(code: str, poste: dict, kb_postes: dict) -> dict:
             "note": poste.get("raison", "Donnée indisponible."),
         }
 
+    qte = poste["volume_m3"]
     montant = round(qte * pu) if pu is not None else None
     source = poste.get("source_override") or "regle_locale"
     if poste.get("valeur_par_defaut_utilisee") and "source_override" not in poste:
@@ -69,35 +60,52 @@ def build_devis(bilan: dict, knowledge_base: dict, project_name: str, location: 
                 "de chantier, remblais détaillés) -- à compléter manuellement.",
     })
 
-    # ---- Section III (béton, infrastructure) ----
+    # ---- Section III (béton, infrastructure + superstructure partielle) ----
+    # v47 -- ventilée par sous-section (Infrastructures / Superstructures),
+    # comme sur le canevas de référence original, au lieu d'un seul bloc
+    # "III. BETON" fourre-tout sans distinction visuelle entre les deux.
+    # `lignes` reste la liste à plat (total, Explorer, compatibilité) ;
+    # `sous_sections` porte le détail groupé pour un rendu avec titres.
     lignes_iii = []
+    sous_sections_iii = []
     for sous_section in SECTION_III_BETON["sous_sections"]:
         if sous_section.get("hors_perimetre"):
             continue
+        lignes_sous_section = []
         for code in sous_section["codes"]:
             poste_key = next((k for k, c in POSTE_KEY_TO_CODE.items() if c == code), None)
-            if poste_key is None:
+            if poste_key is None or poste_key not in postes:
                 # Poste officiel du devis sans équivalent calculé par ce pipeline
                 # (ex: 3.2 béton banché/cyclopéen fondation filante -- notre
-                # extraction ne distingue pas ce type d'élément).
+                # extraction ne distingue pas ce type d'élément), OU poste
+                # ajouté (ex: 3.5bis raidisseurs) mais rien détecté sur CE
+                # projet précis (poste_key connu mais absent de postes --
+                # v37: sans ce garde-fou, ça levait une KeyError).
                 kb = kb_postes.get(code, {})
-                lignes_iii.append({
+                ligne = {
                     "code": code, "designation": kb.get("designation", code),
                     "unite": kb.get("unite", "m3"), "quantite": None,
                     "prix_unitaire_fcfa": kb.get("prix_unitaire_fcfa"), "montant_fcfa": None,
                     "source": "indisponible",
-                    "note": "Non distingué par le schéma d'extraction actuel -- à compléter manuellement.",
-                })
-                continue
-            lignes_iii.append(_ligne_from_poste(code, postes[poste_key], kb_postes))
+                    "note": (
+                        "Non distingué par le schéma d'extraction actuel -- à compléter manuellement."
+                        if poste_key is None else
+                        "Aucun élément de ce type détecté sur les plans de ce projet."
+                    ),
+                }
+            else:
+                ligne = _ligne_from_poste(code, postes[poste_key], kb_postes)
+            lignes_sous_section.append(ligne)
+            lignes_iii.append(ligne)
+        sous_sections_iii.append({"titre": sous_section["titre"], "lignes": lignes_sous_section})
+
     sections_out.append({
         "numero": "III", "titre": SECTION_III_BETON["titre"],
-        "lignes": lignes_iii,
-        "note": "Infrastructures (3.1-3.10) et superstructures (3.11-3.22) toutes deux calculées "
-                "depuis les plans/note de calcul fournis. Prix unitaires 3.11 à 3.22 pas encore "
-                "renseignés dans la base de prix -- quantités affichées, montant à compléter. "
-                "Le poste 3.18 (escaliers) reste volontairement à compléter manuellement, pour "
-                "éviter un double comptage avec 3.9/3.10.",
+        "lignes": lignes_iii, "sous_sections": sous_sections_iii,
+        "note": "Reste de la superstructure (poutres, chaînages, raidisseurs, appuis de baies, dalle "
+                "pleine, éléments décoratifs, rampes, plancher corps creux, escaliers d'étage) hors "
+                "périmètre -- nécessite un bordereau de poutres/note de calcul dédiée ou des plans "
+                "supplémentaires, non traités par ce pipeline pour l'instant.",
     })
 
     total_general = sum(l["montant_fcfa"] for s in sections_out for l in s["lignes"] if l["montant_fcfa"])
@@ -110,8 +118,6 @@ def build_devis(bilan: dict, knowledge_base: dict, project_name: str, location: 
         "sections": sections_out,
         "sections_hors_perimetre": [s["titre"] for s in SECTIONS_HORS_PERIMETRE]
         + ["I. " + SECTION_I_GENERALITES["titre"]],
-        # Nom de clé conservé pour compatibilité (front-end/PDF y font référence) --
-        # couvre en réalité toutes les sections chiffrées (II + III, infra + superstructure).
         "total_infrastructure_fcfa": total_general,
         "postes_a_completer_manuellement": a_confirmer,
         "avertissements": [],

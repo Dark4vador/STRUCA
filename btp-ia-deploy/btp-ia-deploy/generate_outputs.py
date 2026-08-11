@@ -28,13 +28,15 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
+from missing_info import _normalise_type as _normalise_type_reseau, EXCLUS_RESEAU_LONGRINES as EXCLUS_RESEAU_LONGRINES_XLSX
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-from devis_template import SECTION_I_GENERALITES, SECTION_II_TERRASSEMENT, SECTIONS_HORS_PERIMETRE, POSTE_KEY_TO_CODE
+from devis_template import SECTION_I_GENERALITES, SECTION_II_TERRASSEMENT, SECTION_III_BETON, SECTIONS_HORS_PERIMETRE, POSTE_KEY_TO_CODE
 
 HEADER_FILL = "10b981"
 SECTION_FILL = "e5e7eb"
@@ -55,9 +57,15 @@ DEFAULT_PARAMS = {
     "epaisseur_beton_proprete_cm": 10,
     "epaisseur_dallage_cm": 13,
     "epaisseur_voile_cm": 20,
-    "largeur_semelle_filante_cm": 40,
-    "hauteur_semelle_filante_cm": 20,
+    "volume_beton_banche_m3": 0,
 }
+# v25 -- bug corrigé: la feuille Excel attendait deux clés
+# "largeur_semelle_filante_cm"/"hauteur_semelle_filante_cm" qui n'ont
+# JAMAIS existé côté réponses utilisateur -- missing_info.py ne produit
+# qu'une seule clé combinée "section_semelle_filante_cm" (ex: "40x20"),
+# donc ce paramètre retombait TOUJOURS sur le repli codé en dur ci-dessous,
+# quelle que soit la réponse réellement confirmée par l'utilisateur.
+DEFAULT_SECTION_SEMELLE_FILANTE_CM = "40x20"
 
 
 def _fmt_fcfa(n) -> str:
@@ -109,8 +117,7 @@ def _write_parametres(ws, answers: dict, kb: dict, header_fill, param_fill, bord
         "epaisseur_beton_proprete_cm": ("Épaisseur béton de propreté (cm)", "cm"),
         "epaisseur_dallage_cm": ("Épaisseur dallage (cm)", "cm"),
         "epaisseur_voile_cm": ("Épaisseur voile en soubassement (cm)", "cm"),
-        "largeur_semelle_filante_cm": ("Largeur semelle filante sous longrines (cm, poste 3.4)", "cm"),
-        "hauteur_semelle_filante_cm": ("Hauteur semelle filante sous longrines (cm, poste 3.4)", "cm"),
+        "volume_beton_banche_m3": ("Volume béton banché/cyclopéen fondations filantes (m3, poste 3.2)", "m3"),
     }
     param_cells = {}
     for key, (label, unit) in param_labels.items():
@@ -122,6 +129,26 @@ def _write_parametres(ws, answers: dict, kb: dict, header_fill, param_fill, bord
         c.font = Font(bold=True)
         ws.cell(row=row, column=3, value=f"Modifie cette cellule pour recalculer le devis (unité: {unit}).").font = Font(italic=True, size=9, color="666666")
         param_cells[key] = f"'Paramètres'!${get_column_letter(2)}${row}"
+        row += 2
+
+    # v25 -- section semelle filante: une SEULE réponse utilisateur
+    # ("section_semelle_filante_cm", ex: "40x20") mais deux paramètres
+    # séparés nécessaires pour les formules Largeur/Hauteur ci-dessous.
+    section_sf = answers.get("section_semelle_filante_cm") or DEFAULT_SECTION_SEMELLE_FILANTE_CM
+    largeur_sf, hauteur_sf = _split_section(section_sf)
+    if largeur_sf is None:
+        largeur_sf, hauteur_sf = _split_section(DEFAULT_SECTION_SEMELLE_FILANTE_CM)
+    for sub_key, sub_label, sub_val in [
+        ("largeur_semelle_filante_cm", "Largeur semelle filante sous longrines (cm, poste 3.4)", largeur_sf),
+        ("hauteur_semelle_filante_cm", "Hauteur semelle filante sous longrines (cm, poste 3.4)", hauteur_sf),
+    ]:
+        ws.cell(row=row, column=1, value=sub_label).border = border
+        c = ws.cell(row=row, column=2, value=sub_val)
+        c.border = border
+        c.fill = param_fill
+        c.font = Font(bold=True)
+        ws.cell(row=row, column=3, value="Modifie cette cellule pour recalculer le devis (unité: cm).").font = Font(italic=True, size=9, color="666666")
+        param_cells[sub_key] = f"'Paramètres'!${get_column_letter(2)}${row}"
         row += 2
 
     row += 1
@@ -153,7 +180,7 @@ def _write_parametres(ws, answers: dict, kb: dict, header_fill, param_fill, bord
 # Feuille "Bilan Éléments"
 # ------------------------------------------------------------------------
 
-def _write_bilan_elements(ws, bilan: dict, param_cells: dict, header_fill, border):
+def _write_bilan_elements(ws, bilan: dict, answers: dict, param_cells: dict, header_fill, border):
     for i, w in enumerate([26, 12, 12, 12, 12, 14, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -223,7 +250,24 @@ def _write_bilan_elements(ws, bilan: dict, param_cells: dict, header_fill, borde
     row = _table_header(row, ["Section", "Nombre", "Aire section (m2)", "Hauteur (m, param.)", "Volume béton (m3)", "", ""])
     first_row = row
     hc = param_cells["hauteur_soubassement_m"]
-    for item in bilan.get("poteaux", {}).get("par_section", []):
+    # v25 -- priorité de source : (1) comptage individuel par section, sinon
+    # (2) répartition EXACTE lue en légende (colonne Quantité, voir
+    # pipeline.py: total_legende_par_section), sinon (3) total global +
+    # section représentative confirmée par l'utilisateur. Avant ce correctif,
+    # cette table ne lisait QUE la source (1) -- sur une grille dense sans
+    # comptage individuel fiable, elle restait vide même quand (2) ou (3)
+    # avaient bien été calculés côté bilan/réponses utilisateur.
+    _poteaux_rows = (
+        bilan.get("poteaux", {}).get("par_section")
+        or bilan.get("poteaux", {}).get("total_legende_par_section")
+        or []
+    )
+    if not _poteaux_rows:
+        _total_global = bilan.get("poteaux", {}).get("total_legende_global")
+        _section_confirmee = answers.get("section_poteaux_total_global_cm")
+        if _total_global and _section_confirmee:
+            _poteaux_rows = [{"section": _section_confirmee, "nombre_total": _total_global}]
+    for item in _poteaux_rows:
         a_cm, b_cm = _split_section(item["section"])
         aire = round((a_cm / 100) * (b_cm / 100), 4) if a_cm and b_cm else None
         ws.cell(row=row, column=1, value=item["section"]).border = border
@@ -246,6 +290,33 @@ def _write_bilan_elements(ws, bilan: dict, param_cells: dict, header_fill, borde
     ws.cell(row=row, column=5, value=f"=SUM(E{first_row}:E{last_row})").font = Font(bold=True)
     total_cells["3.5"] = f"{SHEET}!$E${row}"
     row += 3
+
+    # ---- v38 -- Raidisseurs (3.5bis, poste ajouté hors canevas standard --
+    # voir pipeline.py/devis_template.py). Même hauteur de soubassement que
+    # les potelets ci-dessus. Table absente jusqu'ici -- total_cells n'avait
+    # donc jamais de clé "3.5bis", même quand le poste existait côté bilan. ----
+    _raidisseurs_rows = bilan.get("raidisseurs_legende_par_section") or []
+    if _raidisseurs_rows:
+        ws.cell(row=row, column=1, value="Raidisseurs (niveau soubassement -- poste ajouté 3.5bis)").font = Font(bold=True, size=12)
+        row += 1
+        row = _table_header(row, ["Désignation", "Section", "Nombre", "Aire section (m2)", "Hauteur (m, param.)", "Volume béton (m3)", ""])
+        first_row = row
+        for item in _raidisseurs_rows:
+            a_cm, b_cm = _split_section(item["section"])
+            aire = round((a_cm / 100) * (b_cm / 100), 4) if a_cm and b_cm else None
+            ws.cell(row=row, column=1, value=item["designation"]).border = border
+            ws.cell(row=row, column=2, value=item["section"]).border = border
+            ws.cell(row=row, column=3, value=item["nombre_total"]).border = border
+            ws.cell(row=row, column=4, value=aire).border = border
+            r = row
+            ws.cell(row=row, column=5, value=f"={hc}").border = border
+            ws.cell(row=row, column=6, value=f"=D{r}*C{r}*E{r}").border = border
+            row += 1
+        last_row = row - 1
+        ws.cell(row=row, column=1, value="TOTAL").font = Font(bold=True)
+        ws.cell(row=row, column=6, value=f"=SUM(F{first_row}:F{last_row})").font = Font(bold=True)
+        total_cells["3.5bis"] = f"{SHEET}!$F${row}"
+        row += 3
 
     # ---- Voiles (3.6, dépend de hauteur + épaisseur voile) ----
     ws.cell(row=row, column=1, value="Voiles en soubassement").font = Font(bold=True, size=12)
@@ -285,7 +356,36 @@ def _write_bilan_elements(ws, bilan: dict, param_cells: dict, header_fill, borde
     row += 1
     row = _table_header(row, ["Section", "Tronçons", "Longueur totale (m)", "Largeur (m)", "Volume béton (m3)", "Largeur x Longueur (m2)", ""])
     first_row = row
-    for item in bilan.get("longrines_par_section", []):
+    # ---- v34 -- repli réseau continu : si aucun tronçon individuellement
+    # désigné (bilan["longrines_par_section"] vide) mais un réseau continu
+    # détecté en légende ET une longueur totale confirmée par l'utilisateur
+    # (longueur_reseau_longrine_totale -- v32, une seule longueur pour tout
+    # le réseau, appliquée à la section la plus grosse détectée), construit
+    # une ligne unique à partir de cette confirmation. Ce bloc pointait
+    # encore vers l'ancienne clé de réponse (longueur_totale_reseau_
+    # longrines_m, abandonnée depuis v29/v32) -- jamais mise à jour lors des
+    # refontes de missing_info.py, donc cette table restait vide même
+    # quand missing_info.py avait bien calculé le volume correspondant.
+    _longrines_rows = bilan.get("longrines_par_section") or []
+    if not _longrines_rows:
+        _longueur_confirmee = answers.get("longueur_reseau_longrine_totale")
+        _types_valides = [
+            t for t in (bilan.get("longrines_reseau_continu") or [])
+            if _normalise_type_reseau(t.get("type_designation")) not in EXCLUS_RESEAU_LONGRINES_XLSX
+        ]
+        if _longueur_confirmee and _types_valides:
+            _section_max_item = max(
+                (t for t in _types_valides if _split_section(t["section"])[0] is not None),
+                key=lambda t: (lambda a, b: a * b)(*_split_section(t["section"])),
+                default=None,
+            )
+            if _section_max_item:
+                _longrines_rows = [{
+                    "section": _section_max_item["section"],
+                    "nombre_troncons": None,
+                    "longueur_totale_m": _longueur_confirmee,
+                }]
+    for item in _longrines_rows:
         a_cm, b_cm = _split_section(item["section"])
         largeur_m = round(min(a_cm, b_cm) / 100, 4) if a_cm and b_cm else None
         aire_section = round((a_cm / 100) * (b_cm / 100), 4) if a_cm and b_cm else None
@@ -455,17 +555,29 @@ def _write_bilan_elements(ws, bilan: dict, param_cells: dict, header_fill, borde
 # Feuille "DEVIS QUANTITATIF"
 # ------------------------------------------------------------------------
 
-def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: dict, project_name: str,
-                  location: str, avertissements: list, header_fill, section_fill, warn_fill, border):
+def _write_devis(ws, devis: dict, header_fill, section_fill, warn_fill, border):
+    """v39 -- réécrit pour transcrire directement les lignes déjà chiffrées
+    de `devis` (le même dict que le JSON/PDF, construit une seule fois par
+    devis_builder.build_devis) au lieu de reconstruire ses propres
+    Quantité/PU/Montant via des formules cross-feuilles (=total_cells[...]).
+
+    Avant ce correctif, CETTE feuille -- celle que le client ouvre en
+    premier -- ne contenait AUCUNE valeur en dur: dès que le recalcul
+    LibreOffice échouait (environnement de déploiement sans LibreOffice,
+    ou tout autre accroc), TOUT redevenait vide d'un coup (quantités, prix,
+    montants), même quand chaque calcul sous-jacent était juste. Les
+    valeurs sont maintenant écrites telles quelles, indépendamment de tout
+    recalcul -- ce fichier ne peut plus dépendre de savoir si LibreOffice
+    est installé sur le serveur ou non."""
     col_widths = [8, 46, 8, 12, 14, 16, 30]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.merge_cells("A1:G1")
-    ws["A1"] = f"DEVIS QUANTITATIF ET ESTIMATIF — {project_name}"
+    ws["A1"] = f"DEVIS QUANTITATIF ET ESTIMATIF — {devis['projet']}"
     ws["A1"].font = Font(size=15, bold=True)
     ws.merge_cells("A2:G2")
-    ws["A2"] = f"{location} — {date.today().isoformat()} — voir notes pour les postes hors périmètre"
+    ws["A2"] = f"{devis['localisation']} — {date.today().isoformat()} — Infrastructure uniquement (voir notes)"
     ws["A2"].font = Font(size=10, italic=True, color="666666")
 
     row = 4
@@ -482,115 +594,93 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
     c.fill = warn_fill
     row += 2
 
-    sections_codes = [
-        ("II", SECTION_II_TERRASSEMENT["titre"],
-         "Seuls les postes 2.3/2.4 (fouilles) sont calculés depuis les plans structure. "
-         "Les postes 2.1/2.2/2.5 à 2.8 dépendent de données hors périmètre -- à compléter manuellement.",
-         ["2.3", "2.4"]),
-        ("III", "BETON - BETON ARME",
-         "Infrastructures (3.1-3.10) et superstructures (3.11-3.22) calculées depuis les plans/note "
-         "de calcul fournis. Prix unitaires 3.11 à 3.22 pas encore renseignés dans la base de prix "
-         "(knowledge_base.json) -- quantités affichées, montant à compléter. Le poste 3.18 (escaliers) "
-         "reste volontairement à compléter manuellement pour éviter un double comptage avec 3.9/3.10.",
-         ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10",
-          "3.11", "3.12", "3.13", "3.14", "3.15", "3.16", "3.17", "3.18", "3.19", "3.20", "3.21", "3.22"]),
-    ]
-
-    montant_ranges_by_section = []
-    for numero, titre, note, codes in sections_codes:
+    montant_total_general = 0
+    for section in devis["sections"]:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
-        c = ws.cell(row=row, column=1, value=f"{numero}. {titre}")
+        c = ws.cell(row=row, column=1, value=f"{section['numero']}. {section['titre']}")
         c.font = Font(bold=True, size=12)
         c.fill = section_fill
         row += 1
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
-        c = ws.cell(row=row, column=1, value=f"⚠ {note}")
-        c.font = Font(italic=True, size=9, color="884400")
-        c.fill = warn_fill
-        row += 1
-
-        for i, h in enumerate(headers, start=1):
-            c = ws.cell(row=row, column=i, value=h)
-            c.font = Font(bold=True, color="ffffff")
-            c.fill = header_fill
-            c.border = border
-            c.alignment = Alignment(horizontal="center")
-        row += 1
-
-        first_data_row = row
-        for code in codes:
-            info = kb.get("postes", {}).get(code, {})
-            poste = postes_by_code.get(code)
-            pu_cell = pu_cells.get(code)
-            quantite = None
-            if poste and not poste.get("donnee_indisponible", True):
-                quantite = poste.get("volume_m3")
-                if quantite is None:
-                    quantite = poste.get("quantite_m2")
-            indispo = quantite is None
-
-            # Repli sur la désignation/unité calculées par le pipeline
-            # (poste['designation_devis']/['unite']) quand le code n'a pas
-            # encore d'entrée dans knowledge_base.json -- sans ça, les
-            # postes 3.11 à 3.22 (pas encore dans la base de prix) affichaient
-            # juste "3.11" comme désignation et une unité vide.
-            designation = info.get("designation") or (poste.get("designation_devis") if poste else None) or code
-            unite = info.get("unite") or (poste.get("unite") if poste else None) or ""
-
-            ws.cell(row=row, column=1, value=code).border = border
-            ws.cell(row=row, column=2, value=designation).border = border
-            ws.cell(row=row, column=3, value=unite).border = border
-
-            r = row
-            if indispo:
-                cq = ws.cell(row=row, column=4, value="À COMPLÉTER")
-                cpu = ws.cell(row=row, column=5, value=(f"={pu_cell}" if pu_cell else "-"))
-                cm_ = ws.cell(row=row, column=6, value="-")
-                note_cell = ws.cell(row=row, column=7, value=raisons.get(code) or "Non calculable (donnée hors périmètre ou question non posée).")
-                for cc in (cq, cpu, cm_, note_cell):
-                    cc.fill = warn_fill
-            elif pu_cell:
-                # Valeur littérale déjà calculée en Python (bilan["volumes_beton"]),
-                # PAS une formule pointant vers une autre feuille -- garantit un
-                # affichage correct même dans un viewer qui ne recalcule pas les
-                # formules à l'ouverture (contrairement à une référence croisée).
-                cq = ws.cell(row=row, column=4, value=round(quantite, 2))
-                cpu = ws.cell(row=row, column=5, value=f"={pu_cell}")
-                cm_ = ws.cell(row=row, column=6, value=f"=D{r}*E{r}")
-                note_cell = ws.cell(row=row, column=7, value=raisons.get(code) or "")
-            else:
-                # Quantité connue mais prix unitaire absent de la base de prix
-                # (ex: 3.11-3.22, pas encore renseignés) -- surtout NE PAS
-                # laisser une cellule PU vide se traduire en "0 FCFA" via la
-                # formule D*E (Excel traite une cellule vide comme 0).
-                cq = ws.cell(row=row, column=4, value=round(quantite, 2))
-                cpu = ws.cell(row=row, column=5, value="-")
-                cm_ = ws.cell(row=row, column=6, value="-")
-                note_cell = ws.cell(row=row, column=7, value=raisons.get(code)
-                                     or "Prix unitaire non renseigné dans la base de prix (knowledge_base.json).")
-            for cc in (cq, cpu, cm_, note_cell):
-                cc.border = border
-                if cc.column in (4, 5, 6):
-                    cc.alignment = Alignment(horizontal="right")
+        if section.get("note"):
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+            c = ws.cell(row=row, column=1, value=f"⚠ {section['note']}")
+            c.font = Font(italic=True, size=9, color="884400")
+            c.fill = warn_fill
             row += 1
-        last_data_row = row - 1
 
+        def _write_header():
+            nonlocal row
+            for i, h in enumerate(headers, start=1):
+                c = ws.cell(row=row, column=i, value=h)
+                c.font = Font(bold=True, color="ffffff")
+                c.fill = header_fill
+                c.border = border
+                c.alignment = Alignment(horizontal="center")
+            row += 1
+
+        def _write_lignes(lignes):
+            nonlocal row
+            first_data_row = row
+            for ligne in lignes:
+                indispo = ligne["source"] == "indisponible"
+
+                ws.cell(row=row, column=1, value=ligne["code"]).border = border
+                ws.cell(row=row, column=2, value=ligne["designation"]).border = border
+                ws.cell(row=row, column=3, value=ligne["unite"]).border = border
+
+                if indispo:
+                    cq = ws.cell(row=row, column=4, value="À COMPLÉTER")
+                    cpu = ws.cell(row=row, column=5, value=ligne["prix_unitaire_fcfa"] if ligne["prix_unitaire_fcfa"] else "-")
+                    cm_ = ws.cell(row=row, column=6, value="-")
+                    note_cell = ws.cell(row=row, column=7, value=ligne["note"] or "Non calculable (donnée hors périmètre ou question non posée).")
+                    for cc in (cq, cpu, cm_, note_cell):
+                        cc.fill = warn_fill
+                else:
+                    cq = ws.cell(row=row, column=4, value=ligne["quantite"])
+                    cpu = ws.cell(row=row, column=5, value=ligne["prix_unitaire_fcfa"])
+                    cm_ = ws.cell(row=row, column=6, value=ligne["montant_fcfa"])
+                    note_cell = ws.cell(row=row, column=7, value=ligne["note"] or "")
+                for cc in (cq, cpu, cm_, note_cell):
+                    cc.border = border
+                    if cc.column in (4, 5, 6):
+                        cc.alignment = Alignment(horizontal="right")
+                row += 1
+            return first_data_row, row - 1
+
+        # v47 -- si la section porte une ventilation par sous-section
+        # (ex: III -> Infrastructures / Superstructures, comme sur le
+        # canevas de référence), affiche chaque sous-groupe avec son propre
+        # titre + en-têtes, au lieu d'un seul bloc fourre-tout.
+        if section.get("sous_sections"):
+            for sous in section["sous_sections"]:
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+                c = ws.cell(row=row, column=1, value=sous["titre"])
+                c.font = Font(bold=True, size=11, italic=True)
+                row += 1
+                _write_header()
+                _write_lignes(sous["lignes"])
+                row += 1  # ligne blanche entre sous-sections
+        else:
+            _write_header()
+            _write_lignes(section["lignes"])
+
+        sous_total = sum(l["montant_fcfa"] for l in section["lignes"] if l["montant_fcfa"])
+        montant_total_general += sous_total
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
         c = ws.cell(row=row, column=1, value="Sous-total section")
         c.font = Font(bold=True)
         c.alignment = Alignment(horizontal="right")
-        c2 = ws.cell(row=row, column=6, value=f"=SUM(F{first_data_row}:F{last_data_row})")
+        c2 = ws.cell(row=row, column=6, value=sous_total)
         c2.font = Font(bold=True)
         c2.alignment = Alignment(horizontal="right")
-        montant_ranges_by_section.append(f"F{row}")
         row += 2
 
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    c = ws.cell(row=row, column=1, value="TOTAL GÉNÉRAL (postes chiffrés, HTVA)")
+    c = ws.cell(row=row, column=1, value="TOTAL INFRASTRUCTURE (postes chiffrés, HTVA)")
     c.font = Font(bold=True, size=13)
     c.fill = section_fill
     c.alignment = Alignment(horizontal="right")
-    c2 = ws.cell(row=row, column=6, value="=" + "+".join(montant_ranges_by_section))
+    c2 = ws.cell(row=row, column=6, value=montant_total_general)
     c2.font = Font(bold=True, size=13)
     c2.fill = section_fill
     c2.alignment = Alignment(horizontal="right")
@@ -604,6 +694,7 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
         row += 1
     row += 1
 
+    avertissements = devis.get("avertissements") or []
     if avertissements:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
         ws.cell(row=row, column=1, value="Observations (relecture IA) :").font = Font(bold=True, size=11)
@@ -615,9 +706,8 @@ def _write_devis(ws, kb: dict, postes_by_code: dict, pu_cells: dict, raisons: di
 
 
 def generate_excel(bilan: dict, answers: dict, kb: dict, project_name: str, location: str,
-                    avertissements: list, out_path: str):
+                    devis: dict, out_path: str):
     wb = Workbook()
-    wb.calculation.fullCalcOnLoad = True
     header_fill = PatternFill("solid", fgColor=HEADER_FILL)
     section_fill = PatternFill("solid", fgColor=SECTION_FILL)
     warn_fill = PatternFill("solid", fgColor=WARN_FILL)
@@ -630,20 +720,10 @@ def generate_excel(bilan: dict, answers: dict, kb: dict, project_name: str, loca
     param_cells, pu_cells = _write_parametres(ws_param, answers, kb, header_fill, param_fill, border)
 
     ws_elem = wb.create_sheet("Bilan Éléments")
-    total_cells = _write_bilan_elements(ws_elem, bilan, param_cells, header_fill, border)
-
-    raisons = {}
-    postes_by_code = {}
-    all_postes = bilan.get("volumes_beton", {}).get("postes", {})
-    for poste_key, code in POSTE_KEY_TO_CODE.items():
-        poste = all_postes.get(poste_key)
-        postes_by_code[code] = poste
-        if poste and poste.get("raison"):
-            raisons[code] = poste["raison"]
+    _write_bilan_elements(ws_elem, bilan, answers, param_cells, header_fill, border)
 
     ws_devis = wb.create_sheet("DEVIS QUANTITATIF")
-    _write_devis(ws_devis, kb, postes_by_code, pu_cells, raisons, project_name, location, avertissements,
-                 header_fill, section_fill, warn_fill, border)
+    _write_devis(ws_devis, devis, header_fill, section_fill, warn_fill, border)
 
     wb.save(out_path)
     return out_path
@@ -664,7 +744,7 @@ def generate_pdf(devis: dict, out_path: str):
     doc = SimpleDocTemplate(out_path, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
                              leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     story = [
-        Paragraph(f"Bilan — Devis Quantitatif — {devis['projet']}", title_style),
+        Paragraph(f"Bilan — Devis Quantitatif Infrastructure — {devis['projet']}", title_style),
         Paragraph(f"{devis['localisation']} — {date.today().isoformat()}", sub_style),
         Spacer(1, 10),
     ]
@@ -706,7 +786,7 @@ def generate_pdf(devis: dict, out_path: str):
     story.append(Spacer(1, 10))
     total_style = ParagraphStyle("TotalFR", parent=styles["Heading2"], alignment=2)
     story.append(Paragraph(
-        f"TOTAL GÉNÉRAL (HTVA) : {_fmt_fcfa(devis['total_infrastructure_fcfa'])} FCFA", total_style))
+        f"TOTAL INFRASTRUCTURE (HTVA) : {_fmt_fcfa(devis['total_infrastructure_fcfa'])} FCFA", total_style))
 
     story.append(Spacer(1, 14))
     story.append(Paragraph("Autres lots (hors périmètre de cette extraction, à compléter manuellement) :", section_style))

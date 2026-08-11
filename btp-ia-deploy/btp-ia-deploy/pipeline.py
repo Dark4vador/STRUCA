@@ -20,35 +20,37 @@ Passe 3 (agrégation) : calcul 100% déterministe en Python (pas de LLM)
 des totaux, avec détail par page, dédupliqué à travers les pages par
 (désignation, repère début, repère fin) -- normalisé (espaces/casse) pour
 éviter les faux doublons/faux distincts dus au bruit de lecture.
-
-Multi-documents : run_pipeline() accepte une LISTE de PDF (ex: "Plan de
-Fondation.pdf" + "Note de calcul.pdf" + "Plan de Coffrage R+1.pdf" envoyés
-comme fichiers séparés plutôt qu'un seul PDF fusionné). Passe 1 et Passe 2
-tournent sur l'ensemble des pages de TOUS les fichiers réunis dans un même
-pool -- chaque page retenue porte son fichier d'origine ("fichier") en plus
-de son numéro de page LOCAL à ce fichier ("page"), pour l'audit. Passe 3
-agrège across-fichiers exactement comme elle agrège across-pages: aucune
-distinction n'est faite entre "page 4 du même PDF" et "page 2 d'un PDF
-séparé" -- c'est ce qui permet de lire les longrines sur le plan de
-fondation (fichier A) même quand aucun "plan de longrine" dédié n'existe
-dans le lot de fichiers envoyés (voir _is_valid_longrine_designation et
-LONGRINE_CONTENT_MARKERS dans schemas.py pour le repli complémentaire par
-contenu, indépendant du titre ET du fichier).
 """
 
 import re
-from pathlib import Path
 import fitz  # PyMuPDF
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from schemas import (
-    classify_title, SCHEMA_PLAN_EXECUTION, PROMPT_PLAN_EXECUTION,
-    SCHEMA_NOTE_CALCUL, PROMPT_NOTE_CALCUL,
-)
+from schemas import classify_title, SCHEMA_PLAN_EXECUTION, PROMPT_PLAN_EXECUTION
 from gemini_client import call_vision_json, GeminiError
 
 MAX_WORKERS = 3  # ~15 RPM Gemini Flash-Lite -> 3 en parallele reste largement sous la limite
 DPI = 260  # résolution plus haute pour bien distinguer les libellés à suffixes serrés (LG8.1, LG8.2...)
+# v22 -- résolution renforcée pour les catégories les plus sujettes aux
+# grilles denses (beaucoup de poteaux rapprochés) : fondation et longrine.
+# 'coffrage' et 'archi' restent à DPI standard (moins souvent aussi denses,
+# et coffrage est de toute façon désactivé par défaut -- voir TITLE_KEYWORDS).
+DPI_DENSE = 340
+_DENSE_CATEGORIES = {"fondation", "longrine"}
+
+# Libellé "métier" par catégorie de page, pour que les messages de
+# progression parlent d'ÉLÉMENTS BTP (ce que l'utilisateur reconnaît et
+# attend) plutôt que d'un seul numéro de page. Le schéma d'extraction est
+# unique (SCHEMA_PLAN_EXECUTION) et cherche systématiquement TOUS ces
+# éléments sur chaque page retenue, quelle que soit sa catégorie -- ce
+# libellé reste indicatif de ce qu'on s'attend à trouver le plus souvent.
+CATEGORY_ELEMENTS_LABEL = {
+    "fondation": "semelles, poteaux et longrines (3.1-3.5, 3.7)",
+    "longrine": "longrines et semelles filantes (3.4, 3.7)",
+    "archi": "surfaces architecturales et dallage",
+    "escalier": "marches et bèche d'escalier (3.9-3.10)",
+    "coffrage": "poteaux de superstructure (3.11)",
+}
 
 
 def extract_cartouche_title(page) -> str:
@@ -68,7 +70,7 @@ def render_page_png(page, dpi=DPI) -> bytes:
     return pix.tobytes("png")
 
 
-def process_page(source_file: str, page_index: int, category: str, image_bytes: bytes, on_log=None) -> dict:
+def process_page(page_index: int, category: str, image_bytes: bytes, on_log=None) -> dict:
     """Un seul appel vision sur la page entière, sans découpage en tuiles.
 
     Historique: on a essayé le découpage en tuiles (pour mieux lire les
@@ -79,24 +81,19 @@ def process_page(source_file: str, page_index: int, category: str, image_bytes: 
     légèrement différents d'une tuile/passe à l'autre est difficile à
     dédupliquer de façon fiable). Un seul appel sur la page complète est
     plus lent à égaliser en précision de lecture sur les tout petits
-    libellés, mais ne peut structurellement pas dupliquer un élément.
-
-    source_file identifie le PDF d'origine (nom de fichier tel qu'envoyé)
-    -- utile uniquement pour l'audit multi-documents ; page_index reste le
-    numéro de page LOCAL à ce fichier."""
+    libellés, mais ne peut structurellement pas dupliquer un élément."""
+    label = f"Extraction : {CATEGORY_ELEMENTS_LABEL.get(category, category)} — p.{page_index + 1} ({category})"
+    if on_log:
+        on_log(f"{label}...")
     try:
-        if category == "note_calcul":
-            prompt, schema = PROMPT_NOTE_CALCUL, SCHEMA_NOTE_CALCUL
-        else:
-            prompt, schema = PROMPT_PLAN_EXECUTION, SCHEMA_PLAN_EXECUTION
-        data = call_vision_json(image_bytes, prompt, schema)
+        data = call_vision_json(image_bytes, PROMPT_PLAN_EXECUTION, SCHEMA_PLAN_EXECUTION)
         if on_log:
-            on_log(f"{source_file} — page {page_index + 1} ({category}): OK")
-        return {"fichier": source_file, "page": page_index + 1, "category": category, "data": data, "error": None}
+            on_log(f"{label}: OK")
+        return {"page": page_index + 1, "category": category, "data": data, "error": None}
     except GeminiError as e:
         if on_log:
-            on_log(f"{source_file} — page {page_index + 1} ({category}): ÉCHEC - {e}")
-        return {"fichier": source_file, "page": page_index + 1, "category": category, "data": None, "error": str(e)}
+            on_log(f"{label}: échec — aucun élément n'a pu être extrait de cette page ({e})")
+        return {"page": page_index + 1, "category": category, "data": None, "error": str(e)}
 
 
 # ---------------------------------------------------------------------
@@ -119,7 +116,7 @@ def _aggregate_fondation(pages):
     for r in pages:
         if r["data"] is None or not r["data"].get("semelles"):
             continue
-        per_page.append({"fichier": r.get("fichier"), "page": r["page"], "semelles": r["data"]["semelles"]})
+        per_page.append({"page": r["page"], "semelles": r["data"]["semelles"]})
     return {"par_page": per_page}
 
 
@@ -137,11 +134,15 @@ def _aggregate_poteaux(pages):
        pour le total -- pour audit/vérification.
     """
     legend_map = {}  # designation -> "a x b", construit à travers toutes les pages
+    legend_quantites = {}  # designation -> (section, quantite) -- v21: colonne Quantité de la légende
     for r in pages:
         if r["data"] is None:
             continue
         for leg in r["data"].get("poteaux_legende", []):
-            legend_map[leg["designation"]] = f'{leg["a_cm"]}x{leg["b_cm"]}'
+            section = f'{leg["a_cm"]}x{leg["b_cm"]}'
+            legend_map[leg["designation"]] = section
+            if leg.get("quantite"):
+                legend_quantites[leg["designation"]] = (section, leg["quantite"])
 
     def _norm(v):
         return v.strip().upper() if isinstance(v, str) else v
@@ -165,7 +166,7 @@ def _aggregate_poteaux(pages):
                 page_counts[section] = page_counts.get(section, 0) + 1  # audit par page, non dédupliqué
                 if key not in total_seen:
                     total_seen[key] = section
-            per_page.append({"fichier": r.get("fichier"), "page": r["page"], "nombre_poteaux": len(instances), "detail_par_section": page_counts})
+            per_page.append({"page": r["page"], "nombre_poteaux": len(instances), "detail_par_section": page_counts})
 
         total_by_section = {}
         for section in total_seen.values():
@@ -201,25 +202,92 @@ def _aggregate_poteaux(pages):
 
     # Poteaux de coffrage: comptés séparément par nature (par niveau/étage,
     # ce ne sont pas les mêmes instances physiques qu'au niveau fondation).
+    # v46 -- bug corrigé: contrairement à build_detail() ci-dessus (utilisé
+    # pour fondation/longrine), cette boucle ne retombait JAMAIS sur
+    # legend_map quand la section n'était pas écrite en clair sur CE plan
+    # de coffrage précis -- alors qu'un plan de coffrage désigne presque
+    # toujours ses poteaux par leur seul repère (ex: "P1"), en comptant sur
+    # la légende du plan de fondation pour la section, exactement comme les
+    # instances fondation/longrine. Résultat avant ce correctif: "section
+    # inconnue" systématique dès que la section n'était pas répétée sur le
+    # plan de coffrage lui-même (le cas normal), même quand legend_map
+    # avait déjà la bonne réponse depuis la légende lue ailleurs.
     coffrage_per_page = []
     coffrage_total = {}
     for r in coffrage_pages:
         poteaux = r["data"].get("poteaux_instances", [])
         page_counts = {}
         for p in poteaux:
-            section = p.get("section") or "section inconnue"
+            section = p.get("section") or legend_map.get(p.get("designation"), "section inconnue")
             page_counts[section] = page_counts.get(section, 0) + 1
             coffrage_total[section] = coffrage_total.get(section, 0) + 1
         coffrage_per_page.append({
-            "fichier": r.get("fichier"), "page": r["page"], "niveau": r["data"].get("niveau"),
+            "page": r["page"], "niveau": r["data"].get("niveau"),
             "nombre_poteaux": len(poteaux), "detail_par_section": page_counts,
         })
+
+    # ---- Repli v20 : total global écrit en légende (ex: "Total Poteaux :
+    # 121"), utilisé quand aucun poteau n'a pu être compté fiablement un
+    # par un (grille/calepinage trop dense pour un comptage visuel sûr --
+    # voir PROMPT_PLAN_EXECUTION §4c). Sans ce repli, ces plans
+    # retournaient purement et simplement zéro poteau, silencieusement.
+    total_legende_global = None
+    total_legende_global_page = None
+    for r in pages:
+        if r["data"] is None:
+            continue
+        n = r["data"].get("poteaux_total_legende_global")
+        if n:
+            total_legende_global = n
+            total_legende_global_page = r["page"]
+            break  # une seule légende globale attendue par dossier -- le premier trouvé suffit
+
+    # ---- v21 : répartition par section EXACTE quand la légende a une
+    # colonne Quantité par type (voir PROMPT_PLAN_EXECUTION §4a) -- la
+    # source la plus fiable qui existe, elle rend inutile à la fois le
+    # comptage individuel ET la question "section représentative" posée
+    # pour le simple total global. Priorité maximale si présente.
+    total_legende_par_section = [
+        {"designation": d, "section": s, "nombre_total": n}
+        for d, (s, n) in legend_quantites.items()
+    ] or None
+
+    # ---- v21/v43 : raidisseurs listés dans une légende (souvent celle des
+    # poteaux, distingués par la ligne "Total Raidisseur" -- voir
+    # schemas.py). Deux postes différents selon la catégorie de la page:
+    # fondation/longrine -> soubassement (3.5bis), coffrage -> superstructure
+    # (3.12) -- jamais mélangés, même bug que les voiles avant séparation.
+    raidisseurs_legende_total = {}
+    raidisseurs_coffrage_total = {}
+    for r in pages:
+        if r["data"] is None:
+            continue
+        target = raidisseurs_coffrage_total if r["category"] == "coffrage" else raidisseurs_legende_total
+        for item in r["data"].get("raidisseurs_legende", []) or []:
+            section = f'{item["a_cm"]}x{item["b_cm"]}'
+            if item.get("quantite"):
+                key = (item["designation"], section)
+                target[key] = item["quantite"]
 
     return {
         "source_utilisee_pour_total": source_used,
         "total_par_section": total_par_section,
         "par_page_source": per_page_total,
         "detail_toutes_pages_fondation_longrine": detail_toutes_pages,
+        "total_legende_global": total_legende_global,
+        "total_legende_global_page": total_legende_global_page,
+        "total_legende_par_section": total_legende_par_section,
+        "raidisseurs_legende_par_section": [
+            {"designation": d, "section": s, "nombre_total": n}
+            for (d, s), n in raidisseurs_legende_total.items()
+        ],
+        "raidisseurs_coffrage_par_section": [
+            {"designation": d, "section": s, "nombre_total": n}
+            for (d, s), n in raidisseurs_coffrage_total.items()
+        ],
+        "sections_possibles_legende": [
+            {"designation": leg, "section": sec} for leg, sec in legend_map.items()
+        ],
         "poteaux_coffrage": {
             "par_page": coffrage_per_page,
             "total_par_section": [{"section": s, "nombre_total": n} for s, n in coffrage_total.items()],
@@ -265,7 +333,7 @@ def _aggregate_longrines(pages):
             page_count += 1
 
         per_page.append({
-            "fichier": r.get("fichier"), "page": r["page"], "category": r["category"], "nombre_troncons": page_count,
+            "page": r["page"], "category": r["category"], "nombre_troncons": page_count,
             "longueur_totale_m_page": round(page_total_len, 2),
             "troncons_sans_longueur": sum(1 for t in troncons if t.get("longueur_m") is None),
             "entrees_rejetees_cote_numerique": rejetes,
@@ -282,16 +350,101 @@ def _aggregate_longrines(pages):
         {"section": s, "nombre_troncons": v["nombre_troncons"], "longueur_totale_m": round(v["longueur_totale_m"], 2)}
         for s, v in total_by_section.items()
     ]
-    return {"par_page": per_page, "total_par_section": total_list}
+
+    # ---- Repli v20 : réseau continu (voir PROMPT_PLAN_EXECUTION §5b) --
+    # aucun tronçon désigné individuellement, mais un ou plusieurs types
+    # génériques trouvés en légende (ex: "Longrine-Type 20x40").
+    reseau_continu = {}  # type_designation -> section
+    reseau_continu_pages = []
+    for r in pages:
+        if r["data"] is None:
+            continue
+        for item in r["data"].get("longrines_reseau_continu", []) or []:
+            reseau_continu[item["type_designation"]] = item["section"]
+        if r["data"].get("longrines_reseau_continu"):
+            reseau_continu_pages.append(r["page"])
+
+    # ---- v30 : calcul automatique de la longueur développée du réseau
+    # continu à partir de la grille d'axes (voir PROMPT_PLAN_EXECUTION
+    # §2bis) -- exactement le calcul qu'un humain ferait à la main (somme
+    # des cotes entre axes × nombre de lignes dans l'autre sens), au lieu
+    # de demander à l'utilisateur de le mesurer lui-même. Suppose que
+    # CHAQUE ligne de la grille porte une longrine sur toute sa longueur
+    # (vrai pour un bâtiment simple/rectangulaire à trame régulière -- à
+    # vérifier si le bâtiment a une forme plus complexe, d'où le champ
+    # "detail" exposé pour audit plutôt qu'un chiffre opaque).
+    longueur_reseau_calculee_m = None
+    longueur_reseau_calculee_detail = None
+    for r in pages:
+        if r["data"] is None:
+            continue
+        ga = r["data"].get("grille_axes") or {}
+        cotes_x = ga.get("cotes_intermediaires_x_m") or []
+        cotes_y = ga.get("cotes_intermediaires_y_m") or []
+        nb_axes_y = ga.get("nombre_axes_y")
+        nb_axes_x = ga.get("nombre_axes_x")
+        if cotes_x and nb_axes_y and cotes_y and nb_axes_x:
+            somme_x, somme_y = sum(cotes_x), sum(cotes_y)
+            longueur_reseau_calculee_m = round(somme_x * nb_axes_y + somme_y * nb_axes_x, 2)
+            # v33 -- garde-fou de plausibilité : nombre_axes_y devrait être
+            # proche de len(cotes_x)+1 (le nombre de lignes de grille = le
+            # nombre de segments de cote + 1 sur la dimension qu'elles
+            # couvrent), et symétriquement pour nombre_axes_x/cotes_y. Un
+            # grand écart signale presque toujours une mauvaise lecture du
+            # nombre de lignes (ex: confusion avec un autre repère sur le
+            # plan) plutôt qu'une vraie grille à 70+ lignes -- fréquent sur
+            # les plans très denses. On ne bloque pas le calcul (il reste
+            # utile comme point de départ) mais on le signale clairement
+            # plutôt que de le présenter comme fiable par défaut.
+            attendu_axes_y = len(cotes_x) + 1
+            attendu_axes_x = len(cotes_y) + 1
+            incoherent = (
+                abs(nb_axes_y - attendu_axes_y) > max(2, attendu_axes_y * 0.5)
+                or abs(nb_axes_x - attendu_axes_x) > max(2, attendu_axes_x * 0.5)
+            )
+            longueur_reseau_calculee_detail = {
+                "page": r["page"],
+                "somme_cotes_x_m": round(somme_x, 2), "nombre_axes_y": nb_axes_y,
+                "somme_cotes_y_m": round(somme_y, 2), "nombre_axes_x": nb_axes_x,
+                "hypothese": "chaque ligne de la grille porte une longrine sur toute sa longueur -- à vérifier si le bâtiment n'est pas de forme simple/régulière",
+                "coherent": not incoherent,
+            }
+            if incoherent:
+                longueur_reseau_calculee_detail["avertissement"] = (
+                    f"Nombre de lignes de grille incohérent avec le nombre de cotes lues "
+                    f"(attendu ~{attendu_axes_y} lignes Y depuis {len(cotes_x)} cotes X, lu "
+                    f"{nb_axes_y} ; attendu ~{attendu_axes_x} lignes X depuis {len(cotes_y)} cotes Y, "
+                    f"lu {nb_axes_x}) -- ce calcul est probablement faux (mauvaise lecture du nombre "
+                    "de lignes sur une grille dense), à vérifier avant utilisation."
+                )
+            break  # la grille est propre au bâtiment entier -- la première page complète suffit
+
+    return {
+        "par_page": per_page, "total_par_section": total_list,
+        "reseau_continu_types": [{"type_designation": t, "section": s} for t, s in reseau_continu.items()],
+        "reseau_continu_pages": reseau_continu_pages,
+        "longueur_reseau_calculee_m": longueur_reseau_calculee_m,
+        "longueur_reseau_calculee_detail": longueur_reseau_calculee_detail,
+    }
 
 
 def _aggregate_voiles(pages):
     """Agrège les voiles à travers TOUTES les pages retenues -- un même
     voile physique peut apparaître sur plusieurs plans, donc déduplication
     globale par (designation, repere_debut, repere_fin). Même mécanique
-    que les longrines pour la longueur (déduite des cotes d'axe)."""
+    que les longrines pour la longueur (déduite des cotes d'axe).
+
+    v41 -- sépare les voiles de SOUBASSEMENT (pages fondation/longrine --
+    poste 3.6) des voiles de SUPERSTRUCTURE (pages coffrage, par étage --
+    poste 3.13, futur). Avant cette séparation, activer la catégorie
+    'coffrage' aurait mélangé silencieusement les deux dans le même total
+    -- un voile d'étage aurait gonflé le poste 3.6 (soubassement) à tort.
+    Même principe déjà en place pour les poteaux (poteaux_coffrage,
+    compté séparément du total fondation/longrine)."""
     per_page = []
     total_seen = {}  # (designation, repere_debut, repere_fin) -> longueur_m
+    coffrage_total_seen = {}  # même clé, mais uniquement pages coffrage (par étage)
+    coffrage_per_page = []
 
     for r in pages:
         if r["data"] is None:
@@ -299,6 +452,7 @@ def _aggregate_voiles(pages):
         voiles = r["data"].get("voiles_instances", [])
         if not voiles:
             continue
+        is_coffrage = r["category"] == "coffrage"
         page_total_len = 0.0
         for v in voiles:
             key = (
@@ -306,12 +460,13 @@ def _aggregate_voiles(pages):
                 (v.get("repere_debut") or "").strip().upper() if isinstance(v.get("repere_debut"), str) else v.get("repere_debut"),
                 (v.get("repere_fin") or "").strip().upper() if isinstance(v.get("repere_fin"), str) else v.get("repere_fin"),
             )
-            if key not in total_seen:
-                total_seen[key] = v.get("longueur_m")
+            target_seen = coffrage_total_seen if is_coffrage else total_seen
+            if key not in target_seen:
+                target_seen[key] = v.get("longueur_m")
             if v.get("longueur_m"):
                 page_total_len += v["longueur_m"]
-        per_page.append({
-            "fichier": r.get("fichier"), "page": r["page"], "category": r["category"],
+        entry = {
+            "page": r["page"], "category": r["category"],
             "nombre_voiles": len(voiles),
             "detail": [
                 {"designation": v["designation"], "de": v.get("repere_debut"), "a": v.get("repere_fin"),
@@ -319,22 +474,26 @@ def _aggregate_voiles(pages):
                 for v in voiles
             ],
             "longueur_totale_m_page": round(page_total_len, 2),
-        })
+        }
+        (coffrage_per_page if is_coffrage else per_page).append(entry)
 
-    total_by_designation = {}
-    for (designation, _, _), longueur in total_seen.items():
-        entry = total_by_designation.setdefault(designation, {"nombre": 0, "longueur_totale_m": 0.0, "sans_longueur": 0})
-        entry["nombre"] += 1
-        if longueur:
-            entry["longueur_totale_m"] += longueur
-        else:
-            entry["sans_longueur"] += 1
+    def _totaliser(seen):
+        by_designation = {}
+        for (designation, _, _), longueur in seen.items():
+            e = by_designation.setdefault(designation, {"nombre": 0, "longueur_totale_m": 0.0, "sans_longueur": 0})
+            e["nombre"] += 1
+            if longueur:
+                e["longueur_totale_m"] += longueur
+            else:
+                e["sans_longueur"] += 1
+        return [
+            {"designation": d, "nombre": v["nombre"], "longueur_totale_m": round(v["longueur_totale_m"], 2),
+             "sans_longueur_annotee": v["sans_longueur"]}
+            for d, v in by_designation.items()
+        ]
 
-    total_par_designation = [
-        {"designation": d, "nombre": v["nombre"], "longueur_totale_m": round(v["longueur_totale_m"], 2),
-         "sans_longueur_annotee": v["sans_longueur"]}
-        for d, v in total_by_designation.items()
-    ]
+    total_par_designation = _totaliser(total_seen)
+    coffrage_par_designation = _totaliser(coffrage_total_seen)
 
     return {
         "par_page": per_page,
@@ -342,6 +501,11 @@ def _aggregate_voiles(pages):
         "longueur_totale_m": round(sum(v for v in total_seen.values() if v), 2),
         "total_par_designation": total_par_designation,
         "voiles_sans_longueur_annotee": sum(1 for v in total_seen.values() if not v),
+        "voiles_coffrage": {
+            "par_page": coffrage_per_page,
+            "total_par_designation": coffrage_par_designation,
+            "note": "Comptage séparé (par étage) -- ce ne sont pas les mêmes voiles physiques que le total soubassement (fondation/longrine) ci-dessus.",
+        },
     }
 
 
@@ -353,41 +517,57 @@ def _aggregate_escaliers(pages):
         if r["data"] is None or not r["data"].get("escaliers"):
             continue
         for e in r["data"]["escaliers"]:
-            escaliers.append({**e, "fichier": r.get("fichier"), "page": r["page"]})
+            escaliers.append({**e, "page": r["page"]})
     return escaliers
 
 
-def _aggregate_elements_structurels(pages):
-    """Éléments de superstructure (poteaux, raidisseurs, voiles, poutres,
-    chaînages, appuis de baies, éléments décoratifs, rampes d'accès) lus
-    depuis les pages catégorie 'note_calcul' -- dédupliqués par
-    (type, désignation, niveau). On ne lit QUE des sections/longueurs/
-    nombres bruts ici (jamais un volume m3 déjà calculé) ; le volume est
-    recalculé en Python dans build_volumes_beton, pour rester auditable."""
-    total_seen = {}  # (type, designation, niveau) -> dernière entrée brute vue
+def _aggregate_poutres(pages):
+    """v42 -- poutres de superstructure (poste 3.14), lues sur les pages
+    coffrage/poutraison uniquement (mêmes catégories que les poteaux/voiles
+    de superstructure). Déduplication par (designation, section) à travers
+    les pages -- une même poutre peut apparaître sur plusieurs vues."""
+    seen = {}  # (designation, section) -> longueur_m
     per_page = []
-
     for r in pages:
-        if r["data"] is None:
+        if r["data"] is None or r["category"] != "coffrage":
             continue
-        elements = r["data"].get("elements_structurels", [])
-        if not elements:
+        poutres = r["data"].get("poutres_instances", [])
+        if not poutres:
             continue
-        per_page.append({"fichier": r.get("fichier"), "page": r["page"], "nombre_lignes": len(elements)})
-        for e in elements:
-            niveau = e.get("niveau")
-            key = (
-                (e.get("type") or "").strip().upper(),
-                (e.get("designation") or "").strip().upper(),
-                niveau.strip().upper() if isinstance(niveau, str) else niveau,
-            )
-            total_seen[key] = e
+        for p in poutres:
+            key = ((p.get("designation") or "").strip().upper(), (p.get("section") or "").strip().upper())
+            if key not in seen:
+                seen[key] = p.get("longueur_m")
+        per_page.append({"page": r["page"], "nombre_poutres": len(poutres)})
 
-    par_type = {}
-    for (type_, _designation, _niveau), e in total_seen.items():
-        par_type.setdefault(type_.lower(), []).append(e)
+    total_par_section = {}
+    for (designation, section), longueur in seen.items():
+        e = total_par_section.setdefault(section, {"nombre_troncons": 0, "longueur_totale_m": 0.0})
+        e["nombre_troncons"] += 1
+        if longueur:
+            e["longueur_totale_m"] += longueur
 
-    return {"par_page": per_page, "par_type": par_type}
+    return {
+        "par_page": per_page,
+        "total_par_section": [
+            {"section": s, "nombre_troncons": v["nombre_troncons"], "longueur_totale_m": round(v["longueur_totale_m"], 2)}
+            for s, v in total_par_section.items()
+        ],
+    }
+
+
+def _aggregate_chainage(pages):
+    """v43 -- même principe que longrines_reseau_continu: type/section
+    trouvés en légende sur les plans de coffrage, longueur confirmée en
+    aval par l'utilisateur (impossible à calculer fiablement sans
+    reconstruire la géométrie complète du périmètre + refends porteurs)."""
+    seen = {}  # designation -> section
+    for r in pages:
+        if r["data"] is None or r["category"] != "coffrage":
+            continue
+        for item in r["data"].get("chainage_legende", []) or []:
+            seen[item["designation"]] = item["section"]
+    return {"types": [{"type_designation": d, "section": s} for d, s in seen.items()]}
 
 
 def build_boq(results: list) -> dict:
@@ -397,8 +577,9 @@ def build_boq(results: list) -> dict:
         "poteaux": _aggregate_poteaux(results),
         "longrines": _aggregate_longrines(results),
         "voiles": _aggregate_voiles(results),
+        "poutres": _aggregate_poutres(results),
+        "chainage": _aggregate_chainage(results),
         "escaliers": _aggregate_escaliers(results),
-        "elements_structurels": _aggregate_elements_structurels(results),
     }
 
 
@@ -461,90 +642,6 @@ def _parse_section_height_m(section: str) -> float | None:
     return max(a_cm, b_cm) / 100
 
 
-def _volume_element_structurel(e: dict):
-    """Calcule le volume (m3) d'UNE ligne d'élément de superstructure
-    (issue de la note de calcul), à partir des sections/longueurs/nombres
-    bruts. Renvoie (volume_m3, None) si calculable, ou (None, raison) si
-    des données manquent -- ne devine jamais une dimension absente."""
-    t = e.get("type")
-    section = e.get("section")
-    nombre = e.get("nombre")
-    hauteur = e.get("hauteur_m")
-    longueur = e.get("longueur_totale_m")
-    epaisseur_cm = e.get("epaisseur_cm")
-
-    if t in ("poteau", "raidisseur"):
-        area = _parse_section_area_m2(section) if section else None
-        if area is None or hauteur is None or nombre is None:
-            return None, "section, hauteur ou nombre manquant"
-        return area * hauteur * nombre, None
-
-    if t in ("poutre", "chainage"):
-        area = _parse_section_area_m2(section) if section else None
-        if area is None or longueur is None:
-            return None, "section ou longueur développée manquante"
-        return area * longueur, None
-
-    if t == "voile":
-        if epaisseur_cm is None or hauteur is None or longueur is None:
-            return None, "épaisseur, hauteur ou longueur manquante"
-        return (epaisseur_cm / 100) * hauteur * longueur, None
-
-    if t in ("appui_baie", "element_decoratif"):
-        area = _parse_section_area_m2(section) if section else None
-        if area is not None and longueur is not None:
-            return area * longueur, None
-        if area is not None and hauteur is not None and nombre is not None:
-            return area * hauteur * nombre, None
-        return None, "section incomplète avec ni longueur, ni (hauteur+nombre)"
-
-    if t == "rampe_acces":
-        rampe = e.get("rampe") or {}
-        l, w, ep = rampe.get("longueur_m"), rampe.get("largeur_m"), rampe.get("epaisseur_m")
-        if l is None or w is None or ep is None:
-            return None, "dimensions de rampe (longueur/largeur/épaisseur) manquantes"
-        return l * w * ep, None
-
-    return None, f"type inconnu: {t}"
-
-
-def compute_surfaces_superstructure(results: list) -> dict:
-    """Somme des surfaces de dalle pleine et de plancher corps creux à
-    travers tous les niveaux d'étage (pages catégorie 'archi'), lues
-    directement si annotées sur les plans. Si aucune n'est disponible,
-    donnee_indisponible=True -- saisie manuelle en aval (missing_info.py),
-    conformément au repli demandé plutôt que d'inventer un chiffre."""
-    dalle_pleine_total, corps_creux_total = 0.0, 0.0
-    dalle_pleine_trouvee, corps_creux_trouvee = False, False
-    par_niveau = []
-
-    for r in results:
-        if r["data"] is None or r["category"] != "archi":
-            continue
-        sa = r["data"].get("surface_archi") or {}
-        dp = sa.get("surface_dalle_pleine_m2")
-        cc = sa.get("surface_plancher_corps_creux_m2")
-        if dp is None and cc is None:
-            continue
-        par_niveau.append({
-            "fichier": r.get("fichier"), "page": r["page"], "niveau": r["data"].get("niveau"),
-            "surface_dalle_pleine_m2": dp, "surface_plancher_corps_creux_m2": cc,
-        })
-        if dp is not None:
-            dalle_pleine_total += dp
-            dalle_pleine_trouvee = True
-        if cc is not None:
-            corps_creux_total += cc
-            corps_creux_trouvee = True
-
-    return {
-        "par_niveau": par_niveau,
-        "surface_dalle_pleine_m2": round(dalle_pleine_total, 2) if dalle_pleine_trouvee else None,
-        "surface_plancher_corps_creux_m2": round(corps_creux_total, 2) if corps_creux_trouvee else None,
-        "donnee_indisponible": not (dalle_pleine_trouvee or corps_creux_trouvee),
-    }
-
-
 # Valeurs par défaut couramment utilisées dans les devis BTP burkinabè type
 # -- ne sont JAMAIS appliquées automatiquement ici. Elles ne servent que de
 # suggestion affichée dans la question posée à l'utilisateur (voir
@@ -602,18 +699,78 @@ def build_volumes_beton(bilan: dict, boq: dict) -> dict:
     }
 
     # ---- 3.5 Potelets (poteaux d'infrastructure) -- hauteur indisponible ----
-    postes["potelets"] = {
-        "designation_devis": "3.5 Béton armé pour potelets",
-        "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
-        "raison": (
-            "Hauteur des potelets (du dessus de semelle au niveau du sol) non "
-            "disponible depuis un plan vu de dessus -- nécessite une coupe/élévation "
-            "ou une confirmation utilisateur de la hauteur de soubassement."
-        ),
-        "donnees_disponibles_en_attente": {
-            "sections_poteaux": bilan["poteaux"]["par_section"],
-        },
-    }
+    _total_legende_par_section = bilan["poteaux"].get("total_legende_par_section")
+    _total_legende_global = bilan["poteaux"].get("total_legende_global")
+    if _total_legende_par_section:
+        # v21 : répartition EXACTE par section lue dans la colonne Quantité
+        # de la légende (voir PROMPT_PLAN_EXECUTION §4a) -- la source la
+        # plus fiable, prioritaire sur le comptage individuel ET sur le
+        # simple total global. Il ne manque plus que la hauteur.
+        postes["potelets"] = {
+            "designation_devis": "3.5 Béton armé pour potelets",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": (
+                "Répartition par section connue avec certitude (colonne Quantité de la légende "
+                "poteaux) -- seule la hauteur de soubassement reste à confirmer pour calculer le "
+                "volume."
+            ),
+            "donnees_disponibles_en_attente": {
+                "sections_poteaux": _total_legende_par_section,
+            },
+        }
+    elif not bilan["poteaux"]["par_section"] and _total_legende_global:
+        # Repli v20 : ni comptage par instance ni répartition par section en
+        # légende, seulement un total imprimé global (grille trop dense --
+        # voir PROMPT_PLAN_EXECUTION §4d). Deux inconnues à lever plutôt
+        # qu'une : la hauteur (comme d'habitude) ET la répartition par
+        # section (le total ne dit pas combien de chaque type).
+        postes["potelets"] = {
+            "designation_devis": "3.5 Béton armé pour potelets",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": (
+                f"{_total_legende_global} poteaux comptés globalement via un total imprimé en "
+                "légende (grille trop dense pour un comptage fiable poteau par poteau, et la "
+                "légende n'a pas de colonne Quantité par type) -- répartition par section ET "
+                "hauteur de soubassement à confirmer pour calculer le volume."
+            ),
+            "donnees_disponibles_en_attente": {
+                "total_legende_global": _total_legende_global,
+                "sections_possibles_legende": bilan["poteaux"].get("sections_possibles_legende", []),
+            },
+        }
+    else:
+        postes["potelets"] = {
+            "designation_devis": "3.5 Béton armé pour potelets",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": (
+                "Hauteur des potelets (du dessus de semelle au niveau du sol) non "
+                "disponible depuis un plan vu de dessus -- nécessite une coupe/élévation "
+                "ou une confirmation utilisateur de la hauteur de soubassement."
+            ),
+            "donnees_disponibles_en_attente": {
+                "sections_poteaux": bilan["poteaux"]["par_section"],
+            },
+        }
+
+    # ---- 3.5bis Raidisseurs (niveau soubassement) -- poste AJOUTÉ, absent
+    # de la nomenclature standard du canevas de référence (qui ne prévoit
+    # des raidisseurs qu'en 3.12, au niveau superstructure). Ceux-ci sont
+    # détectés directement sur la légende du plan de fondation (voir
+    # pipeline.py: bilan['raidisseurs_legende_par_section']) -- des éléments
+    # de soubassement distincts, pas les mêmes que 3.12. Même logique de
+    # calcul que les potelets (3.5): même hauteur de soubassement. ----
+    raidisseurs_legende = bilan.get("raidisseurs_legende_par_section") or []
+    if raidisseurs_legende:
+        postes["raidisseurs_soubassement"] = {
+            "designation_devis": "3.5bis Béton armé pour raidisseurs (niveau soubassement -- poste ajouté, absent du canevas standard)",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": (
+                "Raidisseurs détectés sur la légende du plan de fondation (distincts des poteaux) "
+                "-- hauteur de soubassement à confirmer pour calculer le volume (même hauteur que "
+                "pour les potelets, poste 3.5)."
+            ),
+            "donnees_disponibles_en_attente": {"sections_raidisseurs": raidisseurs_legende},
+        }
 
     # ---- 3.6 Voiles en soubassement -- hauteur indisponible ----
     postes["voiles_soubassement"] = {
@@ -628,6 +785,74 @@ def build_volumes_beton(bilan: dict, boq: dict) -> dict:
         },
     }
 
+    # ---- v41 -- 3.11/3.13 Poteaux et voiles de SUPERSTRUCTURE (par étage,
+    # lus sur les plans de coffrage -- catégorie longtemps désactivée). Même
+    # logique que potelets/voiles soubassement, mais avec une hauteur
+    # d'étage courant distincte de la hauteur de soubassement (les deux ne
+    # valent presque jamais la même chose). ----
+    poteaux_coffrage = bilan.get("poteaux_coffrage_par_section") or []
+    if poteaux_coffrage:
+        postes["poteaux_superstructure"] = {
+            "designation_devis": "3.11 Béton armé pour poteaux",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": "Poteaux détectés sur plan(s) de coffrage -- hauteur d'étage courant à confirmer pour calculer le volume.",
+            "donnees_disponibles_en_attente": {"sections_poteaux_coffrage": poteaux_coffrage},
+        }
+
+    # ---- v43 : 3.12 Raidisseurs superstructure (légende trouvée sur un
+    # plan de coffrage -- distincts des raidisseurs de soubassement 3.5bis). ----
+    raidisseurs_coffrage = bilan.get("raidisseurs_coffrage_par_section") or []
+    if raidisseurs_coffrage:
+        postes["raidisseurs_superstructure"] = {
+            "designation_devis": "3.12 Béton armé pour raidisseurs",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": "Raidisseurs détectés sur plan(s) de coffrage -- hauteur d'étage courant à confirmer pour calculer le volume.",
+            "donnees_disponibles_en_attente": {"sections_raidisseurs_coffrage": raidisseurs_coffrage},
+        }
+
+    voiles_coffrage = bilan.get("voiles_coffrage_par_type") or []
+    if voiles_coffrage:
+        postes["voiles_superstructure"] = {
+            "designation_devis": "3.13 Béton armé pour voiles",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": "Voiles détectés sur plan(s) de coffrage -- hauteur d'étage courant et épaisseur voile à confirmer pour calculer le volume.",
+            "donnees_disponibles_en_attente": {"voiles_coffrage_par_type": voiles_coffrage},
+        }
+
+    # ---- v42 : 3.14 Poutres -- section × portée déjà connues (pas besoin
+    # de hauteur d'étage), calculable directement, sans attendre de
+    # confirmation utilisateur -- comme les semelles isolées (3.3). ----
+    poutres = bilan.get("poutres_par_section") or []
+    if poutres:
+        vol_poutres = 0.0
+        poutres_sans_portee = []
+        for item in poutres:
+            aire = _parse_section_area_m2(item["section"])
+            if aire is not None and item["longueur_totale_m"]:
+                vol_poutres += aire * item["longueur_totale_m"]
+            else:
+                poutres_sans_portee.append(item["section"])
+        postes["poutres_superstructure"] = {
+            "designation_devis": "3.14 Béton armé pour poutres",
+            "unite": "m3", "volume_m3": round(vol_poutres, 2), "donnee_indisponible": False,
+            "raison": (
+                f"Portée(s) non cotée(s) pour: {', '.join(poutres_sans_portee)} -- non comptée(s)."
+                if poutres_sans_portee else None
+            ),
+        }
+
+    # ---- v43 : 3.15 Chaînage -- type/section trouvés en légende sur plan
+    # de coffrage, longueur à confirmer par l'utilisateur (identique au
+    # mécanisme réseau continu des longrines, réutilisé tel quel). ----
+    chainage_types = bilan.get("chainage_types") or []
+    if chainage_types:
+        postes["chainage_superstructure"] = {
+            "designation_devis": "3.15 Béton armé pour chaînages",
+            "unite": "m3", "volume_m3": None, "donnee_indisponible": True,
+            "raison": "Chaînage détecté en légende sur plan(s) de coffrage -- longueur développée totale à confirmer pour calculer le volume.",
+            "donnees_disponibles_en_attente": {"chainage_types": chainage_types},
+        }
+
     # ---- 3.7 Longrines ----
     vol_longrines = 0.0
     longrines_manquantes = []
@@ -640,11 +865,32 @@ def build_volumes_beton(bilan: dict, boq: dict) -> dict:
         vol_longrines += width * height * item["longueur_totale_m"]
 
     if not bilan["longrines_par_section"]:
-        postes["longrines"] = {
-            "designation_devis": "3.7 Béton armé pour longrines", "unite": "m3",
-            "volume_m3": None, "donnee_indisponible": True,
-            "raison": "Aucune longrine détectée.",
-        }
+        _reseau = bilan.get("longrines_reseau_continu") or []
+        if _reseau:
+            # Repli v20 : réseau continu détecté (types génériques en légende,
+            # pas de tronçons désignés individuellement -- voir
+            # PROMPT_PLAN_EXECUTION §5b). On ne calcule PAS de longueur ici
+            # (reconstruire la géométrie de la grille de façon fiable n'est
+            # pas possible depuis ce qu'on extrait) -- longueur totale à
+            # confirmer par l'utilisateur, section déjà connue.
+            _types_str = ", ".join(f"{t['type_designation']} {t['section']}" for t in _reseau)
+            postes["longrines"] = {
+                "designation_devis": "3.7 Béton armé pour longrines", "unite": "m3",
+                "volume_m3": None, "donnee_indisponible": True,
+                "raison": (
+                    "Réseau continu de longrines détecté (pas de tronçons individuellement "
+                    f"désignés, mais type(s) générique(s) en légende: {_types_str}) -- "
+                    "longueur développée totale à confirmer (reconstruire la géométrie exacte "
+                    "de la grille depuis le plan n'est pas fiable automatiquement)."
+                ),
+                "donnees_disponibles_en_attente": {"reseau_continu_types": _reseau},
+            }
+        else:
+            postes["longrines"] = {
+                "designation_devis": "3.7 Béton armé pour longrines", "unite": "m3",
+                "volume_m3": None, "donnee_indisponible": True,
+                "raison": "Aucune longrine détectée.",
+            }
     elif longrines_manquantes and len(longrines_manquantes) == len(bilan["longrines_par_section"]):
         # Toutes les sections trouvées existent mais AUCUNE n'a pu être parsée
         # (format inattendu) -- on ne doit surtout pas afficher 0 silencieusement.
@@ -746,98 +992,6 @@ def build_volumes_beton(bilan: dict, boq: dict) -> dict:
                 "raison": "Bèche d'escalier non dessinée/cotée sur les coupes trouvées -- à compléter manuellement.",
             }
 
-    # ---- 3.11-3.16, 3.19, 3.20 Superstructure (poteaux, raidisseurs,
-    # voiles, poutres, chaînages, appuis de baies, éléments décoratifs,
-    # rampes d'accès) -- lus depuis la note de calcul (sections/longueurs/
-    # nombres bruts), volume recalculé en Python (voir
-    # _volume_element_structurel). Priorité donnée à la note de calcul par
-    # construction: ce bloc ne dépend d'aucune donnée du plan archi. ----
-    SUPERSTRUCTURE_TYPES = [
-        ("poteau", "poteaux_superstructure", "3.11 Béton armé pour poteaux"),
-        ("raidisseur", "raidisseurs_superstructure", "3.12 Béton armé pour raidisseurs"),
-        ("voile", "voiles_superstructure", "3.13 Béton armé pour voiles"),
-        ("poutre", "poutres_superstructure", "3.14 Béton armé pour poutres"),
-        ("chainage", "chainages_superstructure", "3.15 Béton armé pour chaînages"),
-        ("appui_baie", "appuis_baies_superstructure", "3.16 Béton armé pour appuis de baies"),
-        ("element_decoratif", "elements_decoratifs_superstructure", "3.19 Béton armé pour élément décoratif"),
-        ("rampe_acces", "rampes_acces_superstructure", "3.20 Béton armé pour rampes d'accès niveau supérieur"),
-    ]
-    elements_par_type = bilan.get("elements_structurels_par_type", {})
-    for type_key, poste_key, designation in SUPERSTRUCTURE_TYPES:
-        items = elements_par_type.get(type_key, [])
-        if not items:
-            postes[poste_key] = {
-                "designation_devis": designation, "unite": "m3",
-                "volume_m3": None, "donnee_indisponible": True,
-                "raison": "Aucune ligne de ce type détectée dans la note de calcul.",
-            }
-            continue
-
-        total_vol = 0.0
-        lignes_incompletes = []
-        for e in items:
-            vol, raison_manquante = _volume_element_structurel(e)
-            if vol is None:
-                lignes_incompletes.append(f'{e.get("designation", "?")} ({raison_manquante})')
-                continue
-            total_vol += vol
-
-        if total_vol > 0:
-            postes[poste_key] = {
-                "designation_devis": designation, "unite": "m3",
-                "volume_m3": round(total_vol, 2), "donnee_indisponible": False,
-                "raison": (f"Ligne(s) ignorée(s) (données incomplètes dans la note de calcul): "
-                           f"{', '.join(lignes_incompletes)}." if lignes_incompletes else None),
-            }
-        else:
-            postes[poste_key] = {
-                "designation_devis": designation, "unite": "m3",
-                "volume_m3": None, "donnee_indisponible": True,
-                "raison": f"Ligne(s) trouvée(s) mais données incomplètes: {', '.join(lignes_incompletes)}.",
-            }
-
-    # ---- 3.17 / 3.21 / 3.22 Surfaces de plancher d'étage (dalle pleine,
-    # corps creux, table de compression) -- lues sur le plan architectural
-    # si distinguées, sinon saisie manuelle (voir missing_info.py). ----
-    surf = bilan.get("surfaces_superstructure", {})
-
-    if surf.get("surface_dalle_pleine_m2") is not None:
-        postes["dalle_pleine_superstructure"] = {
-            "designation_devis": "3.17 Béton armé pour dalle pleine", "unite": "m3",
-            "volume_m3": None, "donnee_indisponible": True,
-            "surface_m2": surf["surface_dalle_pleine_m2"],
-            "raison": "Épaisseur de dalle pleine non confirmée -- nécessaire pour calculer le volume.",
-        }
-    else:
-        postes["dalle_pleine_superstructure"] = {
-            "designation_devis": "3.17 Béton armé pour dalle pleine", "unite": "m3",
-            "volume_m3": None, "donnee_indisponible": True,
-            "raison": "Surface de dalle pleine non distinguée sur le(s) plan(s) archi -- saisie manuelle requise (m² puis épaisseur).",
-        }
-
-    if surf.get("surface_plancher_corps_creux_m2") is not None:
-        cc_m2 = surf["surface_plancher_corps_creux_m2"]
-        postes["plancher_corps_creux"] = {
-            "designation_devis": "3.21 Plancher corps creux en poutrelles hourdis",
-            "unite": "m2", "quantite_m2": cc_m2, "donnee_indisponible": False,
-            "raison": None,
-        }
-        postes["table_compression"] = {
-            "designation_devis": "3.22 Béton armé pour table de compression du plancher en poutrelles hourdis",
-            "unite": "m2", "quantite_m2": cc_m2, "donnee_indisponible": False,
-            "raison": "Même surface que le plancher corps creux (3.21) -- la table de compression recouvre le même footprint.",
-        }
-    else:
-        for key, designation in [
-            ("plancher_corps_creux", "3.21 Plancher corps creux en poutrelles hourdis"),
-            ("table_compression", "3.22 Béton armé pour table de compression du plancher en poutrelles hourdis"),
-        ]:
-            postes[key] = {
-                "designation_devis": designation, "unite": "m2",
-                "quantite_m2": None, "donnee_indisponible": True,
-                "raison": "Surface de plancher corps creux non distinguée sur le(s) plan(s) archi -- saisie manuelle requise.",
-            }
-
     # ---- Postes non couverts du tout par notre extraction actuelle ----
     for key, designation, raison in [
         ("beton_banche_fondation_filante", "3.2 Béton banché ou cyclopéen pour fondations filantes",
@@ -850,10 +1004,6 @@ def build_volumes_beton(bilan: dict, boq: dict) -> dict:
          "Nécessite la profondeur d'ancrage, non extraite des plans en vue de dessus."),
         ("remblais", "2.5-2.7 Remblais (sans/avec apport, hydraulique)",
          "Nécessite des hauteurs/profondeurs verticales, non extraites des plans en vue de dessus."),
-        ("escaliers_superstructure", "3.18 Béton armé pour escaliers",
-         "Volontairement non mappé sur les volées déjà comptées en 3.9/3.10 (infrastructure) -- "
-         "à confirmer si ce poste 3.18 est bien un élément distinct (ex: volées d'étage) avant de "
-         "réutiliser le même calcul, pour éviter un double comptage."),
     ]:
         postes[key] = {
             "designation_devis": designation,
@@ -995,7 +1145,7 @@ def compute_surface_dallage(boq: dict, results: list) -> dict:
     }
 
 
-def build_bilan(boq: dict, surface_dallage: dict, surfaces_superstructure: dict = None) -> dict:
+def build_bilan(boq: dict, surface_dallage: dict) -> dict:
     """Résumé plat et propre, pensé pour être consommé par un LLM de
     raisonnement en aval sans risque de confusion -- pas de détail par
     page, juste les totaux par type d'élément. Le détail complet reste
@@ -1023,86 +1173,69 @@ def build_bilan(boq: dict, surface_dallage: dict, surfaces_superstructure: dict 
         "poteaux": {
             "source": boq["poteaux"]["source_utilisee_pour_total"],
             "par_section": boq["poteaux"]["total_par_section"],
+            "total_legende_global": boq["poteaux"].get("total_legende_global"),
+            "total_legende_par_section": boq["poteaux"].get("total_legende_par_section"),
+            "sections_possibles_legende": boq["poteaux"].get("sections_possibles_legende") or [],
         },
         "poteaux_coffrage_par_section": boq["poteaux"]["poteaux_coffrage"]["total_par_section"],
+        "raidisseurs_legende_par_section": boq["poteaux"].get("raidisseurs_legende_par_section") or [],
+        "raidisseurs_coffrage_par_section": boq["poteaux"].get("raidisseurs_coffrage_par_section") or [],
         "semelles": [_format_element(d, s) for d, s in semelles_seen.items()],
         "radiers": [_format_element(d, s) for d, s in radiers_seen.items()],
         "voiles_par_type": boq["voiles"]["total_par_designation"],
+        "voiles_coffrage_par_type": boq["voiles"]["voiles_coffrage"]["total_par_designation"],
+        "poutres_par_section": boq["poutres"]["total_par_section"],
+        "chainage_types": boq["chainage"]["types"],
         "longrines_par_section": boq["longrines"]["total_par_section"],
+        "longrines_reseau_continu": boq["longrines"].get("reseau_continu_types") or [],
+        "longueur_reseau_calculee_m": boq["longrines"].get("longueur_reseau_calculee_m"),
+        "longueur_reseau_calculee_detail": boq["longrines"].get("longueur_reseau_calculee_detail"),
         "escaliers": boq["escaliers"],
         "surface_dallage": surface_dallage,
-        "elements_structurels_par_type": boq["elements_structurels"]["par_type"],
-        "surfaces_superstructure": surfaces_superstructure or {"donnee_indisponible": True},
     }
 
 
-def run_pipeline(pdf_paths, on_log=None) -> dict:
-    """pdf_paths: un chemin (str, rétrocompatible) OU une liste de chemins
-    -- un par document envoyé (fondation, longrine, coffrage, note de
-    calcul... peuvent être des fichiers séparés). Toutes les pages de tous
-    les documents sont classifiées puis analysées dans un même pool: la
-    Passe 3 agrège across-fichiers exactement comme elle agrège
-    across-pages, donc un plan de fondation envoyé comme fichier séparé
-    du reste sert de repli pour les longrines de la même façon qu'une page
-    de fondation à l'intérieur d'un seul PDF fusionné (voir docstring en
-    tête de fichier)."""
-    if isinstance(pdf_paths, (str, Path)):
-        pdf_paths = [pdf_paths]
+def run_pipeline(pdf_path: str, on_log=None) -> dict:
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
 
-    docs = {}  # label (nom de fichier) -> fitz.Document, dans l'ordre d'envoi
-    for path in pdf_paths:
-        label = Path(path).name
-        if label in docs:
-            # Deux fichiers envoyés avec le même nom -- on désambiguïse
-            # plutôt que d'écraser silencieusement l'un des deux documents.
-            base, dot, ext = label.rpartition(".")
-            label = f"{base or label} ({sum(1 for k in docs if k.startswith(base or label))+1}){dot}{ext}"
-        docs[label] = fitz.open(path)
-
-    total_pages_all = sum(len(d) for d in docs.values())
-
-    # ---- Passe 1: classification gratuite, sur toutes les pages de tous les fichiers ----
-    routed_pages = []  # [(label, page_index, category)]
-    for label, doc in docs.items():
-        for i in range(len(doc)):
-            title = extract_cartouche_title(doc[i])
-            category = classify_title(title)
-            if category:
-                routed_pages.append((label, i, category))
+    # ---- Passe 1: classification gratuite ----
+    routed_pages = []  # [(page_index, category)]
+    for i in range(total_pages):
+        page = doc[i]
+        title = extract_cartouche_title(page)
+        category = classify_title(title)
+        if category:
+            routed_pages.append((i, category))
 
     if on_log:
-        noms = ", ".join(docs.keys())
-        on_log(f"Passe 1 terminée: {len(routed_pages)}/{total_pages_all} pages pertinentes "
-               f"sur {len(docs)} fichier(s) [{noms}] "
-               f"({', '.join(sorted(set(c for _, _, c in routed_pages)))})")
+        on_log(f"Passe 1 terminée: {len(routed_pages)}/{total_pages} pages pertinentes "
+               f"({', '.join(sorted(set(c for _, c in routed_pages)))})")
 
     if not routed_pages:
-        for doc in docs.values():
-            doc.close()
+        doc.close()
         return {"pages_analysees": [], "boq": None,
-                "avertissement": "Aucune page pertinente détectée (fondation/longrine/coffrage) "
-                                  f"dans {len(docs)} fichier(s) envoyé(s)."}
+                "avertissement": "Aucune page pertinente détectée (fondation/longrine/coffrage)."}
 
-    # ---- Passe 2: vision ciblée, en parallèle sur l'ensemble des pages retenues ----
+    # ---- Passe 2: vision ciblée, en parallèle ----
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for label, i, category in routed_pages:
-            image_bytes = render_page_png(docs[label][i])
-            futures.append(executor.submit(process_page, label, i, category, image_bytes, on_log))
+        futures = {}
+        for i, category in routed_pages:
+            dpi = DPI_DENSE if category in _DENSE_CATEGORIES else DPI
+            image_bytes = render_page_png(doc[i], dpi=dpi)
+            futures[executor.submit(process_page, i, category, image_bytes, on_log)] = i
 
         for future in as_completed(futures):
             results.append(future.result())
 
-    for doc in docs.values():
-        doc.close()
-    results.sort(key=lambda r: (r.get("fichier") or "", r["page"]))
+    doc.close()
+    results.sort(key=lambda r: r["page"])
 
     # ---- Passe 3: agrégation déterministe (Python, pas de LLM) ----
     boq = build_boq(results)
     surface_dallage = compute_surface_dallage(boq, results)
-    surfaces_superstructure = compute_surfaces_superstructure(results)
-    bilan = build_bilan(boq, surface_dallage, surfaces_superstructure)
+    bilan = build_bilan(boq, surface_dallage)
     bilan["volumes_beton"] = build_volumes_beton(bilan, boq)
 
     return {
