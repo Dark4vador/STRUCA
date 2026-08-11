@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-python-multipart
-python-dotenv
-requests
-pymupdf
-pillow
-openpyxl
-reportlab
